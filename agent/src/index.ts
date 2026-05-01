@@ -1,7 +1,15 @@
 interface Env {
   DATA_API_URL?: string;
   GROQ_API_KEY?: string;
+  GROQ_API_KEY_ASK?: string;
+  GROQ_ASK_API_KEY?: string;
+  ASK_GROQ_API_KEY?: string;
+  GROQ_API_KEY_COORDINATOR?: string;
+  GROQ_API_KEY_CALIBRATION?: string;
+  GROQ_API_KEY_MAIN?: string;
+  GROQ_MAIN_API_KEY?: string;
   groq?: string;
+  groq2?: string;
   GROQ_MODEL?: string;
   DB?: D1Database;
 }
@@ -183,10 +191,18 @@ interface AskResponse {
   followUp: string;
 }
 
+interface AskQueryResult {
+  label: string;
+  sql: string;
+  rows: Record<string, unknown>[];
+  error: string;
+}
+
 interface RagContext {
   approved: Array<Record<string, unknown>>;
   rejected: Array<Record<string, unknown>>;
   corrected: Array<Record<string, unknown>>;
+  semantic: Array<Record<string, unknown>>;
   history: Record<string, unknown> | null;
   notes: Array<Record<string, unknown>>;
 }
@@ -237,9 +253,12 @@ interface GroqResponse {
   }>;
 }
 
+type GroqPurpose = "default" | "ask" | "coordinator" | "calibration";
+
 const DEFAULT_DATA_API =
   "https://uic-hackathon-data.christian-7f4.workers.dev/query";
 const DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile";
+const EMBEDDING_DIMENSIONS = 128;
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS decisions (
@@ -295,11 +314,28 @@ CREATE TABLE IF NOT EXISTS coordinator_notes (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS decision_embeddings (
+  id TEXT PRIMARY KEY,
+  rag_id TEXT NOT NULL,
+  patient_id TEXT,
+  patient_name TEXT,
+  outcome TEXT NOT NULL,
+  risk_bucket TEXT NOT NULL,
+  top_driver TEXT NOT NULL,
+  patient_tags TEXT NOT NULL,
+  source_text TEXT NOT NULL,
+  vector TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_rag_outcome ON rag_examples(outcome);
 CREATE INDEX IF NOT EXISTS idx_rag_bucket ON rag_examples(risk_bucket);
 CREATE INDEX IF NOT EXISTS idx_rag_driver ON rag_examples(top_driver);
 CREATE INDEX IF NOT EXISTS idx_decisions_pid ON decisions(patient_id);
 CREATE INDEX IF NOT EXISTS idx_notes_pid ON coordinator_notes(patient_id);
+CREATE INDEX IF NOT EXISTS idx_embedding_rag ON decision_embeddings(rag_id);
+CREATE INDEX IF NOT EXISTS idx_embedding_bucket ON decision_embeddings(risk_bucket);
+CREATE INDEX IF NOT EXISTS idx_embedding_driver ON decision_embeddings(top_driver);
 `;
 
 const WEIGHT_CALIBRATION_PROMPT = `
@@ -502,6 +538,8 @@ export default {
           ok: true,
           prompt: "Prompt 1",
           groqConfigured: Boolean(getGroqApiKey(env)),
+          groqAskConfigured: Boolean(getGroqApiKey(env, "ask")),
+          groqDefaultConfigured: Boolean(getGroqApiKey(env, "default")),
           calibrationSource: calibration.source,
         });
       }
@@ -764,14 +802,29 @@ async function handleAsk(request: Request, env: Env): Promise<AskResponse> {
 
   const selectedPatient = compactJson(body.selectedPatient, 9000);
   const rankedPatients = compactJson(body.rankedPatients, 5000);
+  const askRagPacket = await buildAskRagPacket(
+    env,
+    question,
+    body.selectedPatient,
+    body.rankedPatients,
+  );
 
-  if (!getGroqApiKey(env)) {
+  const deterministicRiskCount = await answerRiskBucketCountQuestion(
+    env,
+    question,
+    body.rankedPatients,
+  );
+  if (deterministicRiskCount) {
+    return deterministicRiskCount;
+  }
+
+  if (!getGroqApiKey(env, "ask")) {
     return {
       answer:
-        "Groq is not configured, so I can only use the visible dashboard. Select a patient and I can summarize the Sentinel score, top barriers, and outreach recommendation shown on screen.",
+        "Groq is not configured for the Ask Agent, so I can only use the visible dashboard. Select a patient and I can summarize the Sentinel score, top barriers, and outreach recommendation shown on screen.",
       evidence: [],
       queries: [],
-      followUp: "Configure GROQ_API_KEY to enable open-ended questions.",
+      followUp: "Configure GROQ_API_KEY_ASK or GROQ_API_KEY to enable open-ended questions.",
     };
   }
 
@@ -782,7 +835,15 @@ async function handleAsk(request: Request, env: Env): Promise<AskResponse> {
     }
   }
 
-  const plan = await buildQuestionQueryPlan(env, question, selectedPatient, rankedPatients);
+  const plan = shouldAnswerFromAskRag(question, askRagPacket)
+    ? []
+    : await buildQuestionQueryPlan(
+      env,
+      question,
+      selectedPatient,
+      rankedPatients,
+      compactJson(askRagPacket, 12000),
+    );
   const queryResults = await Promise.all(
     plan.map(async (item) => {
       const sql = normalizeGeneratedSql(item.sql);
@@ -817,18 +878,22 @@ async function handleAsk(request: Request, env: Env): Promise<AskResponse> {
     question,
     selectedPatient,
     rankedPatients,
+    askRagPacket,
     queryResults,
   );
 
   return {
     ...answer,
-    queries: queryResults
+    queries: [
+      ...describeAskRagLookups(askRagPacket),
+      ...queryResults
       .filter((item) => !item.error)
       .map((item) => ({
         label: item.label,
         sql: item.sql,
         rowCount: item.rows.length,
       })),
+    ],
   };
 }
 
@@ -1438,7 +1503,7 @@ async function calibrateWithGroq(env: Env): Promise<CalibrationWeights | null> {
         "Return strict JSON only. Do not include markdown fences or commentary.",
     },
     { role: "user", content: WEIGHT_CALIBRATION_PROMPT },
-  ], 1500);
+  ], 1500, "calibration");
 
   if (!data) {
     return null;
@@ -1513,11 +1578,31 @@ function normalizeCalibration(raw: Record<string, unknown>): CalibrationWeights 
     (sum, item) => sum + item.weight,
     0,
   );
-  if (Math.round(total) !== 100) {
+  if (total <= 0) {
     return fallback;
+  }
+  if (Math.round(total) !== 100) {
+    normalizeModuleWeightsTo100(calibration.module_weights);
   }
 
   return calibration;
+}
+
+function normalizeModuleWeightsTo100(
+  weights: CalibrationWeights["module_weights"],
+): void {
+  const entries = Object.entries(weights) as Array<[keyof CalibrationWeights["module_weights"], ModuleWeight]>;
+  const total = entries.reduce((sum, [, value]) => sum + value.weight, 0) || 1;
+  let running = 0;
+  entries.forEach(([key, value], index) => {
+    if (index === entries.length - 1) {
+      weights[key].weight = Math.max(0, Number((100 - running).toFixed(2)));
+      return;
+    }
+    const normalized = Number(((value.weight / total) * 100).toFixed(2));
+    weights[key].weight = normalized;
+    running += normalized;
+  });
 }
 
 function sentinelScore(
@@ -1664,7 +1749,7 @@ async function buildCoordinatorOutput(
         "Return strict JSON only. Do not include markdown fences or commentary.",
     },
     { role: "user", content: prompt },
-  ], 900);
+  ], 900, "coordinator");
   const parsed = response ? parseJsonObject(response) : null;
   return normalizeCoordinatorOutput(parsed, patient, profile, sentinel);
 }
@@ -1768,6 +1853,13 @@ function buildRagCoordinatorPrompt(
         .map((item) => `CORRECTED: Coordinator added "${readString(item.human_correction, "")}". ${readString(item.lesson, "")}`)
         .join("\n")
     : "No corrections recorded yet.";
+  const semanticBlock = ragContext.semantic.length
+    ? ragContext.semantic
+        .map((item) =>
+          `EMBEDDED MATCH ${readString(item.similarity, "0")} [${readString(item.outcome, "?")} ${readString(item.risk_bucket, "?")}/${readString(item.top_driver, "?")}]: ${readString(item.source_text, "")}`,
+        )
+        .join("\n")
+    : "No embedding matches yet.";
   const history = ragContext.history
     ? `This patient has been reviewed ${readString(ragContext.history.times_searched, "0")} time(s). Last action: ${readString(ragContext.history.last_action, "none")}. Approvals: ${readString(ragContext.history.total_approvals, "0")} | Modifications: ${readString(ragContext.history.total_modifications, "0")} | Rejections: ${readString(ragContext.history.total_rejections, "0")}.`
     : "First time this patient is being reviewed.";
@@ -1827,6 +1919,9 @@ ${rejectedBlock}
 
 What coordinators corrected:
 ${correctedBlock}
+
+Embedding-similar memory:
+${semanticBlock}
 
 Task:
 Apply the lessons above. Avoid rejected patterns. Replicate approved patterns. Incorporate coordinator corrections as default behavior when relevant.
@@ -2168,44 +2263,62 @@ async function callGroq(
   env: Env,
   messages: Array<{ role: "system" | "user"; content: string }>,
   maxTokens: number,
+  purpose: GroqPurpose = "default",
 ): Promise<string | null> {
-  const apiKey = getGroqApiKey(env);
+  const apiKey = getGroqApiKey(env, purpose);
   if (!apiKey) {
     return null;
   }
 
-  try {
-    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: env.GROQ_MODEL || DEFAULT_GROQ_MODEL,
-        temperature: 0.15,
-        max_tokens: maxTokens,
-        response_format: { type: "json_object" },
-        messages,
-      }),
-    });
+  const models = uniqueStrings([
+    env.GROQ_MODEL || DEFAULT_GROQ_MODEL,
+    DEFAULT_GROQ_MODEL,
+    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+  ]);
 
-    if (!response.ok) {
-      return null;
+  for (const model of models) {
+    for (const jsonMode of [true, false]) {
+      try {
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model,
+            temperature: 0.1,
+            max_tokens: maxTokens,
+            ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
+            messages,
+          }),
+        });
+
+        if (!response.ok) {
+          continue;
+        }
+
+        const data = (await response.json()) as GroqResponse;
+        const content = data.choices?.[0]?.message?.content?.trim();
+        if (content) {
+          return content;
+        }
+      } catch {
+        continue;
+      }
     }
-
-    const data = (await response.json()) as GroqResponse;
-    return data.choices?.[0]?.message?.content?.trim() || null;
-  } catch {
-    return null;
   }
+
+  return null;
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)));
 }
 
 function parseJsonObject(text: string): Record<string, unknown> | null {
-  const trimmed = text.trim();
-  const jsonText = trimmed.startsWith("{")
-    ? trimmed
-    : trimmed.slice(trimmed.indexOf("{"), trimmed.lastIndexOf("}") + 1);
+  const jsonText = extractJsonObjectText(text);
   if (!jsonText) {
     return null;
   }
@@ -2215,8 +2328,61 @@ function parseJsonObject(text: string): Record<string, unknown> | null {
       ? (parsed as Record<string, unknown>)
       : null;
   } catch {
+    try {
+      const repaired = jsonText
+        .replace(/```json|```/gi, "")
+        .replace(/[“”]/g, '"')
+        .replace(/[‘’]/g, "'")
+        .replace(/,\s*([}\]])/g, "$1");
+      const parsed = JSON.parse(repaired) as unknown;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+}
+
+function extractJsonObjectText(text: string): string | null {
+  const trimmed = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  const firstBrace = trimmed.indexOf("{");
+  if (firstBrace < 0) {
     return null;
   }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = firstBrace; index < trimmed.length; index += 1) {
+    const char = trimmed[index];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) {
+      continue;
+    }
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return trimmed.slice(firstBrace, index + 1);
+      }
+    }
+  }
+
+  const lastBrace = trimmed.lastIndexOf("}");
+  return lastBrace > firstBrace ? trimmed.slice(firstBrace, lastBrace + 1) : null;
 }
 
 function readModuleWeight(value: unknown, fallback: ModuleWeight): ModuleWeight {
@@ -2303,7 +2469,7 @@ function topModules(calibration: CalibrationWeights): string {
     .join(", ");
 }
 
-async function setupMemoryDatabase(env: Env): Promise<{ success: boolean; message: string; statements: number }> {
+async function setupMemoryDatabase(env: Env): Promise<{ success: boolean; message: string; statements: number; embeddings_backfilled?: number }> {
   if (!env.DB) {
     return { success: false, message: "D1 binding DB is not configured.", statements: 0 };
   }
@@ -2315,10 +2481,13 @@ async function setupMemoryDatabase(env: Env): Promise<{ success: boolean; messag
     await env.DB.prepare(`${statement};`).run();
   }
 
+  const embeddingsBackfilled = await backfillDecisionEmbeddings(env);
+
   return {
     success: true,
-    message: "D1 memory schema created.",
+    message: "D1 memory schema created and embedding memory is ready.",
     statements: statements.length,
+    embeddings_backfilled: embeddingsBackfilled,
   };
 }
 
@@ -2327,11 +2496,12 @@ async function getRagStats(env: Env): Promise<Record<string, unknown>> {
     return { total_decisions: 0, approved_examples: 0, rejected_examples: 0, learning_examples: 0, message: "D1 binding DB is not configured." };
   }
 
-  const [approved, rejected, corrected, totalDecisions] = await Promise.all([
+  const [approved, rejected, corrected, totalDecisions, embeddings] = await Promise.all([
     dbFirst(env, "SELECT COUNT(*) as count FROM rag_examples WHERE outcome = 'positive'"),
     dbFirst(env, "SELECT COUNT(*) as count FROM rag_examples WHERE outcome = 'negative'"),
     dbFirst(env, "SELECT COUNT(*) as count FROM rag_examples WHERE outcome = 'learning'"),
     dbFirst(env, "SELECT COUNT(*) as count FROM decisions"),
+    dbFirst(env, "SELECT COUNT(*) as count FROM decision_embeddings").catch(() => ({ count: 0 })),
   ]);
 
   return {
@@ -2339,7 +2509,8 @@ async function getRagStats(env: Env): Promise<Record<string, unknown>> {
     approved_examples: normalizeNumber(approved?.count),
     rejected_examples: normalizeNumber(rejected?.count),
     learning_examples: normalizeNumber(corrected?.count),
-    message: "Agent has learned from these decisions.",
+    embedding_examples: normalizeNumber(embeddings?.count),
+    message: "Agent has learned from these decisions using SQL filters plus deterministic embedding retrieval.",
   };
 }
 
@@ -2431,7 +2602,7 @@ async function retrieveRagContext(
   }
 
   try {
-    const [approved, rejected, corrected, history, notes] = await Promise.all([
+    const [approved, rejected, corrected, semantic, history, notes] = await Promise.all([
       dbAll(
         env,
         `SELECT lesson, patient_tags, top_driver, risk_bucket
@@ -2459,6 +2630,7 @@ async function retrieveRagContext(
          ORDER BY created_at DESC LIMIT 3`,
         [sentinel.bucket, sentinel.top_driver],
       ),
+      retrieveSemanticRagExamples(env, sentinel),
       dbFirst(
         env,
         `SELECT times_searched, last_action,
@@ -2477,7 +2649,7 @@ async function retrieveRagContext(
       ),
     ]);
 
-    return { approved, rejected, corrected, history, notes };
+    return { approved, rejected, corrected, semantic, history, notes };
   } catch {
     return emptyRagContext();
   }
@@ -2488,6 +2660,7 @@ function emptyRagContext(): RagContext {
     approved: [],
     rejected: [],
     corrected: [],
+    semantic: [],
     history: null,
     notes: [],
   };
@@ -2644,6 +2817,8 @@ async function logDecision(
 async function saveRagExample(
   env: Env,
   input: {
+    patient?: Partial<SummaryRow> & { id?: string };
+    patientName?: string;
     sentinel: SentinelOutput;
     originalRec: unknown;
     action: "approved" | "modified" | "rejected";
@@ -2662,7 +2837,8 @@ async function saveRagExample(
     lesson = `APPROVED pattern for [${input.sentinel.tags.join(", ")}] patients. Top driver was "${input.sentinel.top_driver}". Replicate this recommendation style and specificity level. Risk bucket: ${input.sentinel.bucket}. Score: ${input.sentinel.score}.`;
   } else if (input.action === "modified") {
     outcome = "learning";
-    lesson = `MODIFIED pattern for [${input.sentinel.tags.join(", ")}] patients. Coordinator corrected with: "${input.humanEdit || "not specified"}". Incorporate local knowledge like this before drafting. Do not assume transport or scheduling without asking coordinator first.`;
+    lesson = (await buildModificationLearningLesson(env, input)) ||
+      `MODIFIED pattern for [${input.sentinel.tags.join(", ")}] patients. Coordinator corrected with: "${input.humanEdit || "not specified"}". Incorporate this local knowledge before drafting future recommendations for similar ${input.sentinel.bucket}/${input.sentinel.top_driver} patients.`;
   } else {
     outcome = "negative";
     lesson = `REJECTED pattern for [${input.sentinel.tags.join(", ")}] patients. Reason: "${input.rejectionReason || "not specified"}". Avoid generic recommendations for this tag set. Focus on specific data citations and executable action steps.`;
@@ -2689,6 +2865,723 @@ async function saveRagExample(
       now,
     ],
   );
+
+  await saveDecisionEmbedding(env, {
+    ragId,
+    patientId: input.patient?.id || null,
+    patientName: input.patientName || null,
+    outcome,
+    riskBucket: input.sentinel.bucket,
+    topDriver: input.sentinel.top_driver,
+    patientTags: input.sentinel.tags,
+    sourceText: buildEmbeddingSourceText({
+      outcome,
+      lesson,
+      riskBucket: input.sentinel.bucket,
+      topDriver: input.sentinel.top_driver,
+      tags: input.sentinel.tags,
+      score: input.sentinel.score,
+      humanEdit: input.humanEdit || null,
+      rejectionReason: input.rejectionReason || null,
+    }),
+    createdAt: now,
+  });
+}
+
+async function buildModificationLearningLesson(
+  env: Env,
+  input: {
+    patient?: Partial<SummaryRow> & { id?: string };
+    patientName?: string;
+    sentinel: SentinelOutput;
+    originalRec: unknown;
+    humanEdit?: string | null;
+    finalRec?: unknown;
+  },
+): Promise<string | null> {
+  const edit = input.humanEdit?.trim();
+  if (!edit) {
+    return null;
+  }
+
+  const raw = await callGroq(env, [
+    {
+      role: "system",
+      content:
+        "Return strict JSON only. You convert a care coordinator's modification into a reusable RAG learning rule. Do not invent patient facts. Do not change the Sentinel score.",
+    },
+    {
+      role: "user",
+      content: `
+Coordinator modified a recommendation.
+
+Patient: ${input.patientName || "Unknown patient"}
+Sentinel bucket: ${input.sentinel.bucket}
+Priority: ${input.sentinel.priority}
+Risk score: ${input.sentinel.score}
+Top driver: ${input.sentinel.top_driver}
+Tags: ${input.sentinel.tags.join(", ") || "none"}
+Original recommendation:
+${compactJson(input.originalRec, 4000)}
+Coordinator correction:
+${edit}
+Final recommendation:
+${compactJson(input.finalRec, 4000)}
+
+Return JSON:
+{
+  "lesson": "1-2 sentence reusable rule beginning with MODIFIED LEARNING. Mention the coordinator correction, when to apply it, and what to avoid next time."
+}
+`,
+    },
+  ], 500, "coordinator");
+
+  const parsed = raw ? parseJsonObject(raw) : null;
+  const lesson = readOptionalString(parsed?.lesson);
+  if (!lesson) {
+    return null;
+  }
+  return lesson.startsWith("MODIFIED LEARNING")
+    ? lesson
+    : `MODIFIED LEARNING: ${lesson}`;
+}
+
+async function saveDecisionEmbedding(
+  env: Env,
+  input: {
+    ragId: string;
+    patientId: string | null;
+    patientName: string | null;
+    outcome: string;
+    riskBucket: string;
+    topDriver: string;
+    patientTags: string[];
+    sourceText: string;
+    createdAt: string;
+  },
+): Promise<void> {
+  if (!env.DB) {
+    return;
+  }
+
+  const vector = JSON.stringify(createTextEmbedding(input.sourceText));
+  const params = [
+    `emb_${input.ragId}`,
+    input.ragId,
+    input.patientId,
+    input.patientName,
+    input.outcome,
+    input.riskBucket,
+    input.topDriver,
+    JSON.stringify(input.patientTags),
+    input.sourceText,
+    vector,
+    input.createdAt,
+  ];
+
+  const sql = `
+    INSERT OR REPLACE INTO decision_embeddings
+      (id, rag_id, patient_id, patient_name, outcome, risk_bucket,
+       top_driver, patient_tags, source_text, vector, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+  `;
+
+  try {
+    await dbRun(env, sql, params);
+  } catch {
+    await ensureEmbeddingTable(env);
+    await dbRun(env, sql, params);
+  }
+}
+
+async function ensureEmbeddingTable(env: Env): Promise<void> {
+  if (!env.DB) {
+    return;
+  }
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS decision_embeddings (
+      id TEXT PRIMARY KEY,
+      rag_id TEXT NOT NULL,
+      patient_id TEXT,
+      patient_name TEXT,
+      outcome TEXT NOT NULL,
+      risk_bucket TEXT NOT NULL,
+      top_driver TEXT NOT NULL,
+      patient_tags TEXT NOT NULL,
+      source_text TEXT NOT NULL,
+      vector TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )`,
+    "CREATE INDEX IF NOT EXISTS idx_embedding_rag ON decision_embeddings(rag_id)",
+    "CREATE INDEX IF NOT EXISTS idx_embedding_bucket ON decision_embeddings(risk_bucket)",
+    "CREATE INDEX IF NOT EXISTS idx_embedding_driver ON decision_embeddings(top_driver)",
+  ];
+
+  for (const statement of statements) {
+    await env.DB.prepare(`${statement};`).run();
+  }
+}
+
+async function backfillDecisionEmbeddings(env: Env): Promise<number> {
+  if (!env.DB) {
+    return 0;
+  }
+  await ensureEmbeddingTable(env);
+  const rows = await dbAll(
+    env,
+    `SELECT r.id, r.outcome, r.patient_tags, r.top_driver, r.risk_bucket,
+            r.human_correction, r.rejection_reason, r.lesson, r.created_at
+     FROM rag_examples r
+     LEFT JOIN decision_embeddings e ON e.rag_id = r.id
+     WHERE e.id IS NULL
+     ORDER BY r.created_at DESC
+     LIMIT 100`,
+  );
+
+  for (const row of rows) {
+    const tags = parseStringArray(row.patient_tags);
+    const sourceText = buildEmbeddingSourceText({
+      outcome: readString(row.outcome, "learning"),
+      lesson: readString(row.lesson, ""),
+      riskBucket: readString(row.risk_bucket, ""),
+      topDriver: readString(row.top_driver, ""),
+      tags,
+      score: null,
+      humanEdit: readOptionalString(row.human_correction),
+      rejectionReason: readOptionalString(row.rejection_reason),
+    });
+    await saveDecisionEmbedding(env, {
+      ragId: readString(row.id, `legacy_${Date.now()}`),
+      patientId: null,
+      patientName: null,
+      outcome: readString(row.outcome, "learning"),
+      riskBucket: readString(row.risk_bucket, ""),
+      topDriver: readString(row.top_driver, ""),
+      patientTags: tags,
+      sourceText,
+      createdAt: readString(row.created_at, new Date().toISOString()),
+    });
+  }
+
+  return rows.length;
+}
+
+async function retrieveSemanticRagExamples(
+  env: Env,
+  sentinel: SentinelOutput,
+): Promise<Array<Record<string, unknown>>> {
+  if (!env.DB) {
+    return [];
+  }
+  try {
+    await ensureEmbeddingTable(env);
+    const rows = await dbAll(
+      env,
+      `SELECT outcome, risk_bucket, top_driver, patient_tags, source_text, vector, created_at
+       FROM decision_embeddings
+       ORDER BY created_at DESC
+       LIMIT 100`,
+    );
+    const queryVector = createTextEmbedding(buildSentinelEmbeddingQuery(sentinel));
+    return rows
+      .map((row) => {
+        const vector = parseVector(row.vector);
+        return {
+          ...row,
+          similarity: Number(cosineSimilarity(queryVector, vector).toFixed(3)),
+        };
+      })
+      .filter((row) => normalizeNumber(row.similarity) > 0.12)
+      .sort((a, b) => normalizeNumber(b.similarity) - normalizeNumber(a.similarity))
+      .slice(0, 3);
+  } catch {
+    return [];
+  }
+}
+
+function buildSentinelEmbeddingQuery(sentinel: SentinelOutput): string {
+  return buildEmbeddingSourceText({
+    outcome: "query",
+    lesson: `Current patient pattern. Bucket ${sentinel.bucket}. Priority ${sentinel.priority}. Top driver ${sentinel.top_driver}. Tags ${sentinel.tags.join(", ")}. Breakdown A ${sentinel.breakdown.A} B ${sentinel.breakdown.B} C ${sentinel.breakdown.C} D ${sentinel.breakdown.D} E ${sentinel.breakdown.E} F ${sentinel.breakdown.F} G ${sentinel.breakdown.G}.`,
+    riskBucket: sentinel.bucket,
+    topDriver: sentinel.top_driver,
+    tags: sentinel.tags,
+    score: sentinel.score,
+    humanEdit: null,
+    rejectionReason: null,
+  });
+}
+
+function buildEmbeddingSourceText(input: {
+  outcome: string;
+  lesson: string;
+  riskBucket: string;
+  topDriver: string;
+  tags: string[];
+  score: number | null;
+  humanEdit: string | null;
+  rejectionReason: string | null;
+}): string {
+  return [
+    `outcome:${input.outcome}`,
+    `bucket:${input.riskBucket}`,
+    `top_driver:${input.topDriver}`,
+    `tags:${input.tags.join(",") || "none"}`,
+    input.score === null ? "" : `score:${input.score}`,
+    input.humanEdit ? `human_correction:${input.humanEdit}` : "",
+    input.rejectionReason ? `rejection_reason:${input.rejectionReason}` : "",
+    `lesson:${input.lesson}`,
+  ].filter(Boolean).join(" | ");
+}
+
+function createTextEmbedding(text: string): number[] {
+  const vector = new Array<number>(EMBEDDING_DIMENSIONS).fill(0);
+  const tokens = tokenizeEmbeddingText(text);
+  const features = [...tokens];
+  for (let index = 0; index < tokens.length - 1; index += 1) {
+    features.push(`${tokens[index]}_${tokens[index + 1]}`);
+  }
+
+  for (const token of features) {
+    const hash = hashString(token);
+    const slot = Math.abs(hash) % EMBEDDING_DIMENSIONS;
+    const sign = hash % 2 === 0 ? 1 : -1;
+    const weight = token.includes("_") ? 0.65 : 1;
+    vector[slot] += sign * weight;
+  }
+
+  const norm = Math.sqrt(vector.reduce((sum, value) => sum + value * value, 0)) || 1;
+  return vector.map((value) => Number((value / norm).toFixed(6)));
+}
+
+function tokenizeEmbeddingText(text: string): string[] {
+  const stopwords = new Set([
+    "the", "and", "or", "a", "an", "to", "of", "for", "with", "was", "is",
+    "are", "be", "this", "that", "from", "into", "as", "by", "on", "in",
+  ]);
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s_-]/g, " ")
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length > 1 && !stopwords.has(token))
+    .slice(0, 160);
+}
+
+function hashString(value: string): number {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash | 0;
+}
+
+function parseVector(value: unknown): number[] {
+  if (typeof value !== "string") {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.map((item) => normalizeNumber(item)).slice(0, EMBEDDING_DIMENSIONS)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (!a.length || !b.length) {
+    return 0;
+  }
+  const length = Math.min(a.length, b.length);
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let index = 0; index < length; index += 1) {
+    dot += a[index] * b[index];
+    normA += a[index] * a[index];
+    normB += b[index] * b[index];
+  }
+  return dot / ((Math.sqrt(normA) || 1) * (Math.sqrt(normB) || 1));
+}
+
+function parseStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((item): item is string => typeof item === "string");
+  }
+  if (typeof value !== "string") {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((item): item is string => typeof item === "string")
+      : [];
+  } catch {
+    return value.split(",").map((item) => item.trim()).filter(Boolean);
+  }
+}
+
+async function buildAskRagPacket(
+  env: Env,
+  question: string,
+  selectedPatientValue: unknown,
+  rankedPatientsValue: unknown,
+): Promise<Record<string, unknown>> {
+  const retrievalNotes: string[] = [];
+  const packet: Record<string, unknown> = {
+    retrieval_notes: retrievalNotes,
+  };
+
+  let primaryPatientId = "";
+  let primarySentinel: SentinelOutput | null = null;
+  let selectedName = "";
+
+  if (isRecord(selectedPatientValue)) {
+    const selectedSummary = summarizePatientRecordForAsk(selectedPatientValue);
+    packet.selected_patient = selectedSummary;
+    selectedName = readString(selectedSummary.name, "");
+    primaryPatientId = readPatientIdFromRiskRecord(selectedPatientValue);
+    primarySentinel = readSentinelFromRiskRecord(selectedPatientValue);
+    retrievalNotes.push("Selected patient profile was used as retrieved patient context.");
+  }
+
+  const nameCandidate = extractPatientNameFromGeneralQuestion(question);
+  if (
+    nameCandidate &&
+    (!selectedName || !namesRoughlyMatch(nameCandidate, selectedName))
+  ) {
+    try {
+      const candidates = await findPatientsByName(env, nameCandidate, 1);
+      const patient = candidates[0];
+      if (patient) {
+        const calibration = await getCalibration(env);
+        const risk = await buildPatientRisk(env, patient, calibration);
+        packet.named_patient = summarizeBuiltPatientRiskForAsk(risk);
+        primaryPatientId = patient.id;
+        primarySentinel = risk.sentinel;
+        retrievalNotes.push(`Live patient profile retrieved for ${risk.displayName}.`);
+      }
+    } catch (error) {
+      packet.named_patient_lookup_status =
+        `Live named-patient lookup unavailable: ${error instanceof Error ? error.message : "query failed"}`;
+    }
+  }
+
+  const rankedPatients = Array.isArray(rankedPatientsValue)
+    ? rankedPatientsValue.filter(isRecord)
+    : [];
+  if (rankedPatients.length > 0) {
+    packet.current_population_ranking = summarizeRankedPatientsForAsk(rankedPatients);
+    retrievalNotes.push("Current population ranking was included as retrieved context.");
+  } else if (shouldRetrieveRankingForAsk(question)) {
+    try {
+      const calibration = await getCalibration(env);
+      const freshRanking = await rankPopulationPatients(env, calibration, 20);
+      packet.current_population_ranking = summarizeRankedPatientsForAsk(
+        freshRanking as unknown as Array<Record<string, unknown>>,
+      );
+      retrievalNotes.push("Fresh Top 20 Sentinel ranking was retrieved for the question.");
+    } catch (error) {
+      packet.ranking_lookup_status =
+        `Population ranking lookup unavailable: ${error instanceof Error ? error.message : "query failed"}`;
+    }
+  }
+
+  if (env.DB) {
+    const memory: Record<string, unknown> = {};
+    try {
+      memory.stats = await getRagStats(env);
+    } catch {
+      memory.stats = { message: "D1 memory stats unavailable for this request." };
+    }
+    try {
+      memory.recent_lessons = await dbAll(
+        env,
+        `SELECT outcome, top_driver, risk_bucket, lesson, created_at
+         FROM rag_examples
+         ORDER BY created_at DESC LIMIT 5`,
+      );
+    } catch {
+      memory.recent_lessons = [];
+    }
+    if (primaryPatientId) {
+      try {
+        memory.patient_memory = await getPatientMemory(env, primaryPatientId);
+      } catch {
+        memory.patient_memory = { message: "No patient-specific memory retrieved." };
+      }
+    }
+    if (primarySentinel) {
+      try {
+        memory.embedding_similar_lessons = await retrieveSemanticRagExamples(env, primarySentinel);
+      } catch {
+        memory.embedding_similar_lessons = [];
+      }
+    }
+    packet.d1_memory = memory;
+  }
+
+  return packet;
+}
+
+function summarizeBuiltPatientRiskForAsk(risk: PatientRisk): Record<string, unknown> {
+  return {
+    name: risk.displayName,
+    score: risk.score,
+    risk_bucket: risk.riskLevel,
+    priority: risk.sentinel.priority,
+    top_driver: risk.sentinel.top_driver,
+    tags: risk.sentinel.tags,
+    score_breakdown: risk.sentinel.breakdown,
+    patient_evidence: {
+      age: risk.patient.age,
+      ed_visits: risk.patient.ed_visits,
+      inpatient_visits: risk.patient.inpatient_visits,
+      chronic_condition_count: risk.patient.chronic_condition_count,
+      active_care_plan: Boolean(risk.patient.has_active_careplan),
+      ed_inpatient_total_cost: risk.patient.ed_inpatient_total_cost,
+    },
+    chronic_conditions: risk.clinicalDrivers.slice(0, 10),
+    barriers: risk.barriers.slice(0, 8),
+    sdoh_signals: risk.sdohConditions.slice(0, 8),
+    prapare_signals: risk.prapareSignals.slice(0, 8),
+    medication_signals: risk.medicationSignals,
+    financial_signals: risk.financialSignals,
+    recent_ed_examples: risk.recentEd.slice(0, 3).map((encounter) => ({
+      date: encounter.START,
+      reason: encounter.REASONDESCRIPTION || encounter.DESCRIPTION,
+      cost: encounter.TOTAL_CLAIM_COST,
+    })),
+    management_plan: summarizeCoordinatorForAsk(risk.coordinator as unknown as Record<string, unknown>),
+  };
+}
+
+function summarizePatientRecordForAsk(record: Record<string, unknown>): Record<string, unknown> {
+  const patient = isRecord(record.patient) ? record.patient : {};
+  const sentinel = isRecord(record.sentinel) ? record.sentinel : {};
+  const coordinator = isRecord(record.coordinator) ? record.coordinator : {};
+  const name = readString(
+    record.displayName,
+    cleanName(readString(patient.first, ""), readString(patient.last, "")) || "selected patient",
+  );
+  return {
+    name,
+    score: normalizeNumber(record.score ?? sentinel.score),
+    risk_bucket: readString(record.riskLevel, readString(sentinel.bucket, "")),
+    priority: readString(sentinel.priority, ""),
+    top_driver: readString(sentinel.top_driver, ""),
+    tags: parseStringArray(sentinel.tags),
+    score_breakdown: isRecord(sentinel.breakdown) ? sentinel.breakdown : {},
+    patient_evidence: {
+      age: patient.age ?? null,
+      ed_visits: patient.ed_visits ?? null,
+      inpatient_visits: patient.inpatient_visits ?? null,
+      chronic_condition_count: patient.chronic_condition_count ?? null,
+      active_care_plan: normalizeNumber(patient.has_active_careplan) === 1,
+      ed_inpatient_total_cost: patient.ed_inpatient_total_cost ?? null,
+    },
+    chronic_conditions: parseStringArray(record.clinicalDrivers).slice(0, 10),
+    barriers: parseStringArray(record.barriers).slice(0, 8),
+    sdoh_signals: parseStringArray(record.sdohConditions).slice(0, 8),
+    prapare_signals: parseStringArray(record.prapareSignals).slice(0, 8),
+    medication_signals: isRecord(record.medicationSignals) ? record.medicationSignals : {},
+    financial_signals: isRecord(record.financialSignals) ? record.financialSignals : {},
+    management_plan: summarizeCoordinatorForAsk(coordinator),
+  };
+}
+
+function summarizeCoordinatorForAsk(coordinator: Record<string, unknown>): Record<string, unknown> {
+  const intervention = isRecord(coordinator.recommended_intervention)
+    ? coordinator.recommended_intervention
+    : {};
+  return {
+    risk_summary: readString(coordinator.risk_summary, ""),
+    top_barriers: Array.isArray(coordinator.top_barriers)
+      ? coordinator.top_barriers.filter(isRecord).slice(0, 4)
+      : [],
+    recommended_action: readString(intervention.action, ""),
+    rationale: readString(intervention.rationale, ""),
+    talking_points: parseStringArray(intervention.talking_points).slice(0, 4),
+    patient_facing_outreach: readString(coordinator.patient_facing_outreach, ""),
+    priority_reason: readString(coordinator.priority_reason, ""),
+  };
+}
+
+function summarizeRankedPatientsForAsk(
+  patients: Array<Record<string, unknown>>,
+): Record<string, unknown> {
+  const summarized = patients.slice(0, 20).map((patient) => ({
+    name: readString(patient.displayName, "Unknown patient"),
+    score: normalizeNumber(patient.score),
+    risk_bucket: readRiskBucket(patient),
+    priority: readString(patient.priority, ""),
+    top_driver: readString(patient.topDriver, readString(patient.top_driver, "")),
+    tags: parseStringArray(patient.tags),
+    score_breakdown: isRecord(patient.breakdown) ? patient.breakdown : {},
+  }));
+  return {
+    scope: "Top ranked patients from Sentinel scoring",
+    count: summarized.length,
+    patients: summarized,
+  };
+}
+
+function readPatientIdFromRiskRecord(record: Record<string, unknown>): string {
+  const patient = isRecord(record.patient) ? record.patient : {};
+  return readString(patient.id, readString(record.id, ""));
+}
+
+function readSentinelFromRiskRecord(record: Record<string, unknown>): SentinelOutput | null {
+  const sentinel = isRecord(record.sentinel) ? record.sentinel : null;
+  if (!sentinel) {
+    return null;
+  }
+  const breakdown = isRecord(sentinel.breakdown) ? sentinel.breakdown : {};
+  return {
+    score: normalizeNumber(sentinel.score),
+    bucket: readString(sentinel.bucket, readString(record.riskLevel, "Low")) as SentinelOutput["bucket"],
+    priority: readString(sentinel.priority, "P2") as SentinelOutput["priority"],
+    tags: parseStringArray(sentinel.tags),
+    top_driver: readString(sentinel.top_driver, ""),
+    breakdown: {
+      A: normalizeNumber(breakdown.A),
+      B: normalizeNumber(breakdown.B),
+      C: normalizeNumber(breakdown.C),
+      D: normalizeNumber(breakdown.D),
+      E: normalizeNumber(breakdown.E),
+      F: normalizeNumber(breakdown.F),
+      G: normalizeNumber(breakdown.G),
+    },
+    triage: readString(sentinel.triage, "IGNORE") as SentinelOutput["triage"],
+  };
+}
+
+function shouldRetrieveRankingForAsk(question: string): boolean {
+  return Boolean(
+    question.toLowerCase().match(
+      /\b(top|rank|ranking|highest|who is next|who should|which patients|list patients|population|high risk|medium risk|low risk)\b/,
+    ),
+  );
+}
+
+function shouldAnswerFromAskRag(question: string, packet: Record<string, unknown>): boolean {
+  const normalized = question.toLowerCase();
+  const hasPatientContext = isRecord(packet.selected_patient) || isRecord(packet.named_patient);
+  const hasRankingContext = isRecord(packet.current_population_ranking);
+  const hasMemoryContext = isRecord(packet.d1_memory);
+
+  if (
+    hasPatientContext &&
+    normalized.match(
+      /\b(chronic|condition|management|care plan|plan|intervention|recommend|outreach|barrier|why|risk|score|driver|medication|debt|cost|summary|profile|sdoh|prapare)\b/,
+    )
+  ) {
+    return true;
+  }
+
+  if (
+    hasRankingContext &&
+    normalized.match(/\b(top|rank|ranking|who is next|who should|which patients|list|scores?|priority|bucket)\b/)
+  ) {
+    return true;
+  }
+
+  if (
+    hasMemoryContext &&
+    normalized.match(/\b(memory|learn|rag|decision history|past decision|approved|rejected|modified)\b/)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function describeAskRagLookups(packet: Record<string, unknown>): AskResponse["queries"] {
+  const lookups: AskResponse["queries"] = [];
+  if (isRecord(packet.selected_patient)) {
+    lookups.push({
+      label: "Selected patient RAG profile",
+      sql: "Browser-selected patient profile + Sentinel score",
+      rowCount: 1,
+    });
+  }
+  if (isRecord(packet.named_patient)) {
+    lookups.push({
+      label: "Named patient RAG profile",
+      sql: "Live patient lookup + deterministic Sentinel scoring",
+      rowCount: 1,
+    });
+  }
+  const ranking = isRecord(packet.current_population_ranking)
+    ? packet.current_population_ranking
+    : null;
+  const rankedPatients = Array.isArray(ranking?.patients) ? ranking.patients : [];
+  if (rankedPatients.length > 0) {
+    lookups.push({
+      label: "Population ranking RAG context",
+      sql: "Top 20 deterministic Sentinel ranking",
+      rowCount: rankedPatients.length,
+    });
+  }
+  if (isRecord(packet.d1_memory)) {
+    lookups.push({
+      label: "D1 memory RAG context",
+      sql: "Decision Trail lessons + embedding-similar examples",
+      rowCount: 1,
+    });
+  }
+  return lookups;
+}
+
+function extractPatientNameFromGeneralQuestion(question: string): string {
+  const riskName = extractPatientNameFromRiskQuestion(question);
+  if (riskName) {
+    return riskName;
+  }
+
+  const normalized = question
+    .replace(/[?!.]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const patterns = [
+    /\b(?:what\s+(?:are|is)|show|tell|give|list|explain)\s+(.+?)\s+(?:chronic|condition|conditions|management|care\s+plan|risk|barrier|barriers|recommendation|outreach|profile|medication|debt)\b/i,
+    /\b(?:chronic|condition|conditions|management|care\s+plan|risk|barrier|barriers|recommendation|outreach|profile|medication|debt)\s+(?:for|of|about)\s+(.+?)$/i,
+    /\b(?:for|of|about)\s+(.+?)\s+(?:chronic|condition|conditions|management|care\s+plan|risk|barrier|barriers|recommendation|outreach|profile|medication|debt)\b/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern);
+    if (match?.[1]) {
+      const candidate = cleanupPatientNameCandidate(match[1]);
+      if (isLikelyPatientNameCandidate(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  return "";
+}
+
+function isLikelyPatientNameCandidate(candidate: string): boolean {
+  const tokens = candidate.toLowerCase().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0 || tokens.length > 4) {
+    return false;
+  }
+  const generic = new Set([
+    "what", "which", "who", "why", "how", "the", "this", "that", "patient",
+    "patients", "risk", "high", "medium", "low", "total", "number", "count",
+    "condition", "conditions", "management", "plan", "care", "score",
+  ]);
+  return tokens.some((token) => !generic.has(token));
+}
+
+function namesRoughlyMatch(candidate: string, name: string): boolean {
+  const normalizedName = name.toLowerCase();
+  const tokens = candidate.toLowerCase().split(/\s+/).filter(Boolean);
+  return tokens.length > 0 && tokens.every((token) => normalizedName.includes(token));
 }
 
 async function buildQuestionQueryPlan(
@@ -2696,12 +3589,13 @@ async function buildQuestionQueryPlan(
   question: string,
   selectedPatient: string,
   rankedPatients: string,
+  askRagPacket: string,
 ): Promise<Array<{ label: string; sql: string }>> {
   const prompt = `
 You help a care coordinator answer questions about a synthetic patient dataset.
 Create at most 3 SQLite SELECT queries needed to answer the user's question.
-If the selected patient context already answers the question, return an empty queries array.
-For "why is this patient high risk", "what should we do", "explain the score", or other selected-patient interpretation questions, prefer the selected patient context and return no queries.
+If the database RAG packet or selected patient context already answers the question, return an empty queries array.
+For patient-specific interpretation questions such as chronic conditions, management plan, why high risk, what should we do, explain the score, barriers, or outreach, prefer the RAG packet and return no queries.
 
 Rules:
 - Only SELECT statements.
@@ -2724,6 +3618,9 @@ ${selectedPatient || "none"}
 Current ranked patients:
 ${rankedPatients || "none"}
 
+Database RAG packet already retrieved:
+${askRagPacket || "none"}
+
 Question:
 ${question}
 
@@ -2741,7 +3638,7 @@ Return strict JSON:
       content: "Return strict JSON only. No markdown.",
     },
     { role: "user", content: prompt },
-  ], 700);
+  ], 700, "ask");
   const parsed = raw ? parseJsonObject(raw) : null;
   const queries = Array.isArray(parsed?.queries) ? parsed.queries : [];
   return queries
@@ -2764,18 +3661,22 @@ async function answerQuestionWithGroq(
   question: string,
   selectedPatient: string,
   rankedPatients: string,
-  queryResults: Array<{
-    label: string;
-    sql: string;
-    rows: Record<string, unknown>[];
-    error: string;
-  }>,
+  askRagPacket: Record<string, unknown>,
+  queryResults: AskQueryResult[],
 ): Promise<Omit<AskResponse, "queries">> {
   const prompt = `
-You are the Q&A layer for a healthcare care-coordination demo.
-Answer the user's question in plain English, grounded only in the selected patient context, ranked patients, and query results below.
-If data is missing, say exactly what is missing. Do not invent clinical facts.
+You are the Q&A layer for a healthcare care-coordination agent.
+The database RAG packet below is the primary source. It was retrieved from live patient data, current Sentinel rankings, and Cloudflare D1 decision memory before you were called.
+Answer the user's question in plain English, grounded only in the database RAG packet, selected patient context, ranked patients, and public query summaries below.
+If a supplemental query failed but the RAG packet answers the question, do not mention the failure and do not ask the user to retry.
+If data is truly missing from every source, say exactly what is missing. Do not invent clinical facts.
 Keep the answer concise but useful for a 5-minute hackathon demo.
+Do not expose raw technical identifiers or coding fields such as PATIENT, PATIENTID, ENCOUNTER, SYSTEM, CODE, START, STOP, or UUIDs.
+Prefer patient names, risk scores, ED visits, chronic condition counts, care plan status, condition descriptions, social barriers, medications, debt, and recommendation-relevant facts.
+For chronic-condition and management-plan questions, use the patient chronic_conditions and management_plan fields from the RAG packet.
+
+Database RAG packet:
+${compactJson(askRagPacket, 18000)}
 
 Selected patient context:
 ${selectedPatient || "none"}
@@ -2783,8 +3684,8 @@ ${selectedPatient || "none"}
 Current ranked patients:
 ${rankedPatients || "none"}
 
-Query results:
-${compactJson(queryResults, 14000)}
+Supplemental public query summaries:
+${compactJson(buildPublicQueryContext(queryResults), 12000)}
 
 Question:
 ${question}
@@ -2803,27 +3704,581 @@ Return strict JSON:
       content: "Return strict JSON only. No markdown.",
     },
     { role: "user", content: prompt },
-  ], 900);
+  ], 900, "ask");
   const parsed = raw ? parseJsonObject(raw) : null;
 
   if (!parsed) {
-    return {
-      answer:
-        "I could not get a clean model answer. The live queries ran, so try asking more specifically, for example: 'Why is Lindsay P0?' or 'Which no-care-plan patients are next?'",
-      evidence: queryResults.flatMap((item) =>
-        item.error ? [`${item.label}: ${item.error}`] : [`${item.label}: ${item.rows.length} rows`],
-      ),
-      followUp: "Which patient should I explain next?",
-    };
+    const plainAnswer = sanitizePlainGroqAnswer(raw);
+    if (plainAnswer) {
+      return {
+        answer: plainAnswer,
+        evidence: queryResults
+          .filter((item) => !item.error)
+          .map((item) => `${item.label}: ${item.rows.length} row(s)`)
+          .slice(0, 5),
+        followUp: "Ask me to explain the score drivers or recommend the next action.",
+      };
+    }
+    return buildDeterministicAskFallback(
+      question,
+      selectedPatient,
+      rankedPatients,
+      askRagPacket,
+      queryResults,
+    );
+  }
+
+  const fallback = buildDeterministicAskFallback(
+    question,
+    selectedPatient,
+    rankedPatients,
+    askRagPacket,
+    queryResults,
+  );
+  const answerText = stripTechnicalIdentifiers(
+    readString(parsed.answer, fallback.answer),
+  );
+  if (
+    isUnhelpfulDataFailureAnswer(answerText) &&
+    hasUsableAskRagContext(askRagPacket)
+  ) {
+    return fallback;
   }
 
   return {
-    answer: readString(parsed.answer, "I could not answer that from the available data."),
+    answer: answerText || fallback.answer,
+    evidence: Array.isArray(parsed.evidence)
+      ? parsed.evidence
+          .filter((item): item is string => typeof item === "string")
+          .map(stripTechnicalIdentifiers)
+          .filter(Boolean)
+          .slice(0, 5)
+      : fallback.evidence,
+    followUp: stripTechnicalIdentifiers(
+      readString(parsed.followUp, fallback.followUp),
+    ),
+  };
+}
+
+function buildPublicQueryContext(queryResults: AskQueryResult[]): Array<Record<string, unknown>> {
+  return queryResults.map((item) => {
+    if (item.error) {
+      return {
+        label: item.label,
+        status: "supplemental lookup unavailable",
+      };
+    }
+    const summaries = item.rows
+      .slice(0, 12)
+      .map(summarizeResultRow)
+      .filter(Boolean);
+    return {
+      label: item.label,
+      status: "ok",
+      row_count: item.rows.length,
+      rows: summaries.length ? summaries : ["Rows returned, but no public-facing fields were useful."],
+    };
+  });
+}
+
+function buildAskRagFallbackAnswer(
+  question: string,
+  packet: Record<string, unknown>,
+): Omit<AskResponse, "queries"> | null {
+  const patient = getPrimaryAskRagPatient(packet);
+  const normalized = question.toLowerCase();
+  if (patient) {
+    const name = readString(patient.name, "the selected patient");
+    const score = readString(patient.score, "n/a");
+    const risk = readString(patient.risk_bucket, "risk unknown");
+    const evidence = isRecord(patient.patient_evidence) ? patient.patient_evidence : {};
+    const conditions = parseStringArray(patient.chronic_conditions).slice(0, 6);
+    const barriers = parseStringArray(patient.barriers).slice(0, 5);
+    const plan = isRecord(patient.management_plan) ? patient.management_plan : {};
+    const action = readString(plan.recommended_action, "");
+    const rationale = readString(plan.rationale, "");
+
+    if (normalized.match(/\b(chronic|condition|conditions|management|care plan|plan)\b/)) {
+      const conditionText = conditions.length
+        ? conditions.join(", ")
+        : "no active chronic condition descriptions were included in the retrieved profile";
+      const planText = action
+        ? `${action}${rationale ? ` Rationale: ${rationale}` : ""}`
+        : "no coordinator management plan was included in the retrieved profile";
+      return {
+        answer: `${name}'s retrieved chronic-condition profile includes: ${conditionText}. The current coordinator management plan is: ${planText}`,
+        evidence: [
+          `${name}: Sentinel score ${score}/100, ${risk} risk`,
+          `ED visits: ${readString(evidence.ed_visits, "n/a")}`,
+          `Chronic condition count: ${readString(evidence.chronic_condition_count, "n/a")}`,
+          `Care plan active: ${readString(evidence.active_care_plan, "unknown")}`,
+        ],
+        followUp: `Would you like me to turn this into patient-facing outreach for ${name}?`,
+      };
+    }
+
+    return {
+      answer: `${name} is ${risk} risk with a Sentinel score of ${score}/100. Key drivers in the retrieved profile include ${readString(patient.top_driver, "the Sentinel top driver")}, ${readString(evidence.ed_visits, "n/a")} ED visits, ${readString(evidence.chronic_condition_count, "n/a")} chronic conditions, and ${barriers.slice(0, 2).join("; ") || "no additional barrier text in context"}.`,
+      evidence: [
+        `${name}: Sentinel score ${score}/100`,
+        `Risk bucket: ${risk}`,
+        `Top driver: ${readString(patient.top_driver, "n/a")}`,
+      ],
+      followUp: `Ask for ${name}'s chronic conditions, barriers, or outreach plan.`,
+    };
+  }
+
+  const ranking = isRecord(packet.current_population_ranking)
+    ? packet.current_population_ranking
+    : null;
+  const rankedPatients = Array.isArray(ranking?.patients)
+    ? ranking.patients.filter(isRecord)
+    : [];
+  if (rankedPatients.length > 0) {
+    const top = rankedPatients.slice(0, 10).map((patient) =>
+      `${readString(patient.name, "Unknown patient")} (${readString(patient.risk_bucket, "risk unknown")}, score ${readString(patient.score, "n/a")})`,
+    );
+    return {
+      answer: `From the retrieved Sentinel ranking, the top patients are: ${top.join(", ")}.`,
+      evidence: [`Ranking context included ${rankedPatients.length} patient(s)`],
+      followUp: "Ask me to explain one named patient from the ranking.",
+    };
+  }
+
+  return null;
+}
+
+function getPrimaryAskRagPatient(packet: Record<string, unknown>): Record<string, unknown> | null {
+  if (isRecord(packet.named_patient)) {
+    return packet.named_patient;
+  }
+  if (isRecord(packet.selected_patient)) {
+    return packet.selected_patient;
+  }
+  return null;
+}
+
+function hasUsableAskRagContext(packet: Record<string, unknown>): boolean {
+  return Boolean(
+    isRecord(packet.selected_patient) ||
+    isRecord(packet.named_patient) ||
+    isRecord(packet.current_population_ranking),
+  );
+}
+
+function isUnhelpfulDataFailureAnswer(answer: string): boolean {
+  return Boolean(
+    answer.toLowerCase().match(
+      /\b(failed data api|data api request failed|cannot determine|could not determine|please retry|try again)\b/,
+    ),
+  );
+}
+
+function buildDeterministicAskFallback(
+  question: string,
+  selectedPatient: string,
+  rankedPatients: string,
+  askRagPacket: Record<string, unknown>,
+  queryResults: AskQueryResult[],
+): Omit<AskResponse, "queries"> {
+  const ragFallback = buildAskRagFallbackAnswer(question, askRagPacket);
+  if (ragFallback) {
+    return ragFallback;
+  }
+
+  const successfulQueries = queryResults.filter((item) => !item.error);
+  const rows = successfulQueries.flatMap((item) => item.rows);
+  if (rows.length > 0) {
+    const summaries = uniqueStrings(rows.map(summarizeResultRow).filter(Boolean)).slice(0, 5);
+    return {
+      answer: summaries.length
+        ? `Based on the live data: ${summaries.join(" ")}`
+        : "The live data returned rows, but they only contained technical identifiers. Try asking for a patient summary, risk score, or care barriers.",
+      evidence: successfulQueries.map((item) => `${item.label}: ${item.rows.length} row(s)`).slice(0, 5),
+      followUp: "Ask me to explain one of these patients or run the population ranking.",
+    };
+  }
+
+  const selected = parseJsonText(selectedPatient);
+  if (isRecord(selected)) {
+    const name = readString(selected.displayName, "selected patient");
+    const score = readString(selected.score, "n/a");
+    const riskLevel = readString(selected.riskLevel, "risk unknown");
+    return {
+      answer: `Based on the selected patient context, ${name} is ${riskLevel} risk with a score of ${score}.`,
+      evidence: [`Selected patient: ${name}`, `Risk score: ${score}`, `Risk level: ${riskLevel}`],
+      followUp: `Ask "why is ${name} ${riskLevel} risk?" for the score drivers.`,
+    };
+  }
+
+  const ranked = parseJsonText(rankedPatients);
+  if (Array.isArray(ranked) && ranked.length > 0) {
+    const top = ranked
+      .filter(isRecord)
+      .slice(0, 5)
+      .map((patient) => {
+        const name = readString(patient.displayName, "Unknown patient");
+        const score = readString(patient.score, "n/a");
+        const risk = readString(patient.riskLevel, "risk unknown");
+        return `${name} (${risk}, ${score})`;
+      });
+    return {
+      answer: `Based on the visible ranking, the top results are: ${top.join(", ")}.`,
+      evidence: [`Visible ranking: ${ranked.length} patient(s)`],
+      followUp: "Click a ranked patient, then ask why they are high risk.",
+    };
+  }
+
+  const errors = queryResults
+    .filter((item) => item.error)
+    .map((item) => `${item.label}: ${item.error}`)
+    .slice(0, 3);
+
+  return {
+    answer: `I could not answer "${question}" from the available context. Run a population ranking or select a patient first, then ask again.`,
+    evidence: errors,
+    followUp: "Try: 'how many high risk patients?' or 'why is Lindsay high risk?'",
+  };
+}
+
+function summarizeResultRow(row: Record<string, unknown>): string {
+  const name = readString(row.patient_name, "")
+    || readString(row.displayName, "")
+    || readString(row.name, "")
+    || (readString(row.first, "") || readString(row.last, "")
+      ? cleanName(readString(row.first, ""), readString(row.last, ""))
+      : "");
+
+  const fields = usefulRowFacts(row);
+  if (name) {
+    return `${name}${fields.length ? ` (${fields.join(", ")})` : ""}.`;
+  }
+  return fields.length ? `${fields.join(", ")}.` : "";
+}
+
+function usefulRowFacts(row: Record<string, unknown>): string[] {
+  const facts: string[] = [];
+  const push = (label: string, value: unknown) => {
+    if (value === null || value === undefined || value === "") {
+      return;
+    }
+    const text = String(value);
+    if (looksLikeUuid(text)) {
+      return;
+    }
+    facts.push(`${label}: ${text}`);
+  };
+
+  push("count", row.count ?? row.COUNT ?? row.total ?? row.TOTAL);
+  push("age", row.age ?? row.AGE);
+  push("gender", row.gender ?? row.GENDER);
+  push("race", row.race ?? row.RACE);
+  push("ethnicity", row.ethnicity ?? row.ETHNICITY);
+  push("ED visits", row.ed_visits ?? row.emergency_visits ?? row.ED_VISITS);
+  push("total visits", row.total_visits ?? row.TOTAL_VISITS);
+  push("inpatient visits", row.inpatient_visits ?? row.INPATIENT_VISITS);
+  push("conditions", row.chronic_condition_count ?? row.CHRONIC_CONDITION_COUNT);
+  const carePlan = row.has_active_careplan ?? row.HAS_ACTIVE_CAREPLAN;
+  if (carePlan !== undefined && carePlan !== null && carePlan !== "") {
+    facts.push(`care plan: ${normalizeNumber(carePlan) ? "active" : "none"}`);
+  }
+  push("risk score", row.risk_score ?? row.score ?? row.SCORE);
+  push("risk bucket", row.risk_bucket ?? row.bucket ?? row.BUCKET);
+  push("priority", row.priority ?? row.PRIORITY);
+  push("description", row.DESCRIPTION ?? row.description);
+  push("value", row.VALUE ?? row.value);
+  push("reason", row.REASONDESCRIPTION ?? row.reason_description);
+  push("encounter class", row.ENCOUNTERCLASS ?? row.encounterclass);
+  push("claim cost", row.TOTAL_CLAIM_COST ?? row.total_claim_cost);
+  push("outstanding debt", row.total_outstanding ?? row.TOTAL_OUTSTANDING ?? row.outstanding_debt);
+  push("total cost", row.ed_inpatient_total_cost ?? row.ED_INPATIENT_TOTAL_COST);
+
+  return uniqueStrings(facts).slice(0, 5);
+}
+
+function sanitizePlainGroqAnswer(raw: string | null): string | null {
+  if (!raw) {
+    return null;
+  }
+  const cleaned = stripTechnicalIdentifiers(raw
+    .replace(/```(?:json)?/gi, "")
+    .replace(/```/g, "")
+    .trim());
+  if (!cleaned || cleaned.startsWith("{") || cleaned.length < 20) {
+    return null;
+  }
+  return cleaned.slice(0, 900);
+}
+
+function stripTechnicalIdentifiers(value: string): string {
+  return value
+    .replace(/\b(PATIENTID|PATIENT|ENCOUNTER|SYSTEM|CODE|START|STOP):\s*[^,\n.]+[,.\n]?/gi, "")
+    .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function looksLikeUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+async function answerRiskBucketCountQuestion(
+  env: Env,
+  question: string,
+  rankedPatientsValue: unknown,
+): Promise<AskResponse | null> {
+  const normalized = question.toLowerCase();
+  const asksCount = /\b(total|how many|number of|count)\b/.test(normalized);
+  if (!asksCount || !/\brisk\b/.test(normalized)) {
+    return null;
+  }
+
+  const bucket = normalized.match(/\bhigh[- ]risk\b|\bhigh\b/)
+    ? "High"
+    : normalized.match(/\bmedium[- ]risk\b|\bmedium\b/)
+      ? "Medium"
+      : normalized.match(/\blow[- ]risk\b|\blow\b/)
+        ? "Low"
+        : null;
+
+  if (!bucket) {
+    return null;
+  }
+
+  let rankedPatients = Array.isArray(rankedPatientsValue)
+    ? rankedPatientsValue.filter(isRecord)
+    : [];
+  let source = "current ranked list";
+
+  if (rankedPatients.length === 0) {
+    const calibration = await getCalibration(env);
+    rankedPatients = await rankPopulationPatients(env, calibration, 20) as unknown as Array<Record<string, unknown>>;
+    source = "fresh Top 20 Sentinel ranking";
+  }
+
+  const matching = rankedPatients.filter((patient) =>
+    readRiskBucket(patient) === bucket,
+  );
+  const names = matching
+    .slice(0, 6)
+    .map((patient) => {
+      const name = readString(patient.displayName, "Unknown patient");
+      const score = readString(patient.score, "n/a");
+      const priority = readString(patient.priority, "");
+      return `${name} (score ${score}${priority ? `, priority ${priority}` : ""})`;
+    });
+
+  const computedAnswer: AskResponse = {
+    answer: `There ${matching.length === 1 ? "is" : "are"} ${matching.length} ${bucket.toLowerCase()}-risk patient${matching.length === 1 ? "" : "s"} in the ${source}.` +
+      (names.length ? ` ${matching.length === 1 ? "Patient" : "Patients"}: ${names.join(", ")}.` : ""),
+    evidence: [
+      `${source}: ${rankedPatients.length} patients checked`,
+      `${bucket} risk count: ${matching.length}`,
+      ...names.slice(0, 3),
+    ],
+    queries: [
+      {
+        label: source === "current ranked list" ? "Visible Sentinel ranking" : "Fresh Top 20 Sentinel ranking",
+        sql: "Sentinel deterministic scoring, not a raw SQL risk column",
+        rowCount: rankedPatients.length,
+      },
+    ],
+    followUp: `Would you like me to explain the top ${bucket.toLowerCase()}-risk patient?`,
+  };
+
+  if (!getGroqApiKey(env, "ask")) {
+    return computedAnswer;
+  }
+
+  const raw = await callGroq(env, [
+    {
+      role: "system",
+      content: "Return strict JSON only. You are wording a computed healthcare dashboard answer. Do not change the numbers. Do not describe risk score as age.",
+    },
+    {
+      role: "user",
+      content: `
+User question: ${question}
+
+Computed Sentinel result:
+${JSON.stringify({
+  source,
+  bucket,
+  checked: rankedPatients.length,
+  count: matching.length,
+  patients: matching.slice(0, 6).map((patient) => ({
+    name: readString(patient.displayName, "Unknown patient"),
+    risk_score: readString(patient.score, "n/a"),
+    priority: readString(patient.priority, ""),
+    risk_bucket: readRiskBucket(patient),
+  })),
+})}
+
+Return JSON:
+{
+  "answer": "1-3 sentence answer using the computed numbers exactly",
+  "evidence": ["short evidence item 1", "short evidence item 2"],
+  "followUp": "one useful next question"
+}
+`,
+    },
+  ], 500, "ask");
+  const parsed = raw ? parseJsonObject(raw) : null;
+
+  if (!parsed) {
+    return computedAnswer;
+  }
+
+  const groqAnswer = readString(parsed.answer, computedAnswer.answer);
+  if (/\byears?\s+old\b/i.test(groqAnswer)) {
+    return computedAnswer;
+  }
+
+  return {
+    ...computedAnswer,
+    answer: groqAnswer,
     evidence: Array.isArray(parsed.evidence)
       ? parsed.evidence.filter((item): item is string => typeof item === "string").slice(0, 5)
-      : [],
-    followUp: readString(parsed.followUp, "What would you like to inspect next?"),
+      : computedAnswer.evidence,
+    followUp: readString(parsed.followUp, computedAnswer.followUp),
   };
+}
+
+function readRiskBucket(patient: Record<string, unknown>): string {
+  const riskLevel = readString(patient.riskLevel, "");
+  if (riskLevel) {
+    return riskLevel;
+  }
+  const bucket = readString(patient.bucket, "");
+  if (bucket) {
+    return bucket;
+  }
+  const sentinel = isRecord(patient.sentinel) ? patient.sentinel : null;
+  return sentinel ? readString(sentinel.bucket, "") : "";
+}
+
+async function answerNamedPatientRiskQuestion(
+  env: Env,
+  question: string,
+  selectedPatientValue: unknown,
+): Promise<AskResponse | null> {
+  if (isRecord(selectedPatientValue)) {
+    return null;
+  }
+
+  const name = extractPatientNameFromRiskQuestion(question);
+  if (!name) {
+    return null;
+  }
+
+  const candidates = await findPatientsByName(env, name, 1);
+  const patient = candidates[0];
+  if (!patient) {
+    return null;
+  }
+
+  const calibration = await getCalibration(env);
+  const risk = await buildPatientRisk(env, patient, calibration);
+  const compactRisk = compactJson({
+    displayName: risk.displayName,
+    score: risk.score,
+    riskLevel: risk.riskLevel,
+    priority: risk.sentinel.priority,
+    topDriver: risk.sentinel.top_driver,
+    breakdown: risk.sentinel.breakdown,
+    tags: risk.sentinel.tags,
+    barriers: risk.barriers,
+    clinicalDrivers: risk.clinicalDrivers,
+    sdohConditions: risk.sdohConditions,
+    prapareSignals: risk.prapareSignals,
+    medicationSignals: risk.medicationSignals,
+    financialSignals: risk.financialSignals,
+    coordinator: risk.coordinator,
+    patient: {
+      ed_visits: risk.patient.ed_visits,
+      chronic_condition_count: risk.patient.chronic_condition_count,
+      has_active_careplan: risk.patient.has_active_careplan,
+      ed_inpatient_total_cost: risk.patient.ed_inpatient_total_cost,
+    },
+  }, 9000);
+
+  const raw = await callGroq(env, [
+    {
+      role: "system",
+      content:
+        "Return strict JSON only. Explain a patient's Sentinel risk from the provided scored profile. Do not invent facts. Do not expose raw IDs.",
+    },
+    {
+      role: "user",
+      content: `
+Question: ${question}
+
+Scored patient profile:
+${compactRisk}
+
+Return JSON:
+{
+  "answer": "2-4 sentence answer explaining the risk score, top driver, and 2-3 grounded reasons",
+  "evidence": ["specific data point 1", "specific data point 2", "specific data point 3"],
+  "followUp": "one useful next question"
+}
+`,
+    },
+  ], 700, "ask");
+  const parsed = raw ? parseJsonObject(raw) : null;
+
+  const fallbackAnswer = `${risk.displayName} is ${risk.riskLevel} risk with a Sentinel score of ${risk.score}/100 and priority ${risk.sentinel.priority}. The top driver is ${risk.sentinel.top_driver}; key evidence includes ${risk.patient.ed_visits} ED visits, ${risk.patient.chronic_condition_count} chronic conditions, ${risk.patient.has_active_careplan ? "an active care plan" : "no active care plan"}, and ${risk.barriers.slice(0, 2).join("; ") || "documented care barriers"}.`;
+
+  return {
+    answer: parsed ? readString(parsed.answer, fallbackAnswer) : fallbackAnswer,
+    evidence: parsed && Array.isArray(parsed.evidence)
+      ? parsed.evidence.filter((item): item is string => typeof item === "string").slice(0, 5)
+      : [
+          `Sentinel score: ${risk.score}/100`,
+          `Top driver: ${risk.sentinel.top_driver}`,
+          `${risk.patient.ed_visits} ED visits`,
+          `${risk.patient.chronic_condition_count} chronic conditions`,
+        ],
+    queries: [
+      {
+        label: "Named patient Sentinel analysis",
+        sql: "Live patient lookup + deterministic Sentinel scoring",
+        rowCount: 1,
+      },
+    ],
+    followUp: parsed
+      ? readString(parsed.followUp, `Should I draft outreach for ${risk.displayName}?`)
+      : `Should I draft outreach for ${risk.displayName}?`,
+  };
+}
+
+function extractPatientNameFromRiskQuestion(question: string): string {
+  const normalized = question
+    .replace(/[?!.]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const patterns = [
+    /\bwhy\s+is\s+(.+?)\s+(?:high\s+risk|medium\s+risk|low\s+risk|risky|p0|p1|p2)\b/i,
+    /\bexplain\s+(.+?)\s+(?:high\s+risk|medium\s+risk|low\s+risk|risk|p0|p1|p2)\b/i,
+    /\bwhy\s+(.+?)\s+(?:high\s+risk|medium\s+risk|low\s+risk|risky|p0|p1|p2)\b/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern);
+    if (match?.[1]) {
+      return cleanupPatientNameCandidate(match[1]);
+    }
+  }
+
+  return "";
+}
+
+function cleanupPatientNameCandidate(value: string): string {
+  return value
+    .replace(/\b(patient|the|is|was|are|at|a|an)\b/gi, " ")
+    .replace(/[^a-z0-9'\-\s]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 async function answerMemoryQuestion(env: Env, question: string): Promise<AskResponse | null> {
@@ -2875,7 +4330,7 @@ Return JSON:
 }
 `,
     },
-  ], 700);
+  ], 700, "ask");
   const parsed = raw ? parseJsonObject(raw) : null;
 
   if (!parsed) {
@@ -3358,8 +4813,25 @@ function escapeSql(value: string): string {
   return value.replace(/'/g, "''");
 }
 
-function getGroqApiKey(env: Env): string | undefined {
-  return env.GROQ_API_KEY || env.groq;
+function getGroqApiKey(env: Env, purpose: GroqPurpose = "default"): string | undefined {
+  const mainKey = env.GROQ_API_KEY_MAIN ||
+    env.GROQ_MAIN_API_KEY ||
+    env.GROQ_API_KEY ||
+    env.groq;
+  if (purpose === "ask") {
+    return env.GROQ_API_KEY_ASK ||
+      env.GROQ_ASK_API_KEY ||
+      env.ASK_GROQ_API_KEY ||
+      env.groq2 ||
+      mainKey;
+  }
+  if (purpose === "coordinator") {
+    return env.GROQ_API_KEY_COORDINATOR || mainKey;
+  }
+  if (purpose === "calibration") {
+    return env.GROQ_API_KEY_CALIBRATION || mainKey;
+  }
+  return mainKey;
 }
 
 function cleanName(first: string, last: string): string {

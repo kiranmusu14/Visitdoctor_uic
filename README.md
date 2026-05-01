@@ -42,6 +42,83 @@ examples/
 
 ---
 
+## Team demo: Preventable Visit Detector
+
+This fork includes a working Prompt 1 app in `agent/`.
+
+**Live app:** `https://silent-snow-e388.kkuma37.workers.dev`
+
+The app helps a care coordinator find patients at risk of a preventable ED visit, explain the score, draft outreach, and store the human review decision.
+
+### Architecture
+
+```text
+Browser UI
+  -> Cloudflare Worker
+  -> Live Hackathon Patient Data API
+  -> Sentinel deterministic scoring
+  -> Groq Coordinator / Ask Agent
+  -> Cloudflare D1 decision memory
+  -> Human approve / modify / reject
+  -> D1 RAG lessons for future answers
+```
+
+Key pieces:
+
+- `agent/src/index.ts` serves the UI and Worker API routes.
+- Sentinel scoring is deterministic TypeScript using ED use, care plan status, SDOH, PRAPARE, chronic burden, medications, and financial barriers.
+- Groq calibrates weights, explains the Sentinel result, drafts coordinator outreach, and answers open-ended questions.
+- Cloudflare D1 stores the decision trail, patient history, coordinator notes, RAG lessons, and deterministic embedding vectors for similar past decisions.
+- Modified recommendations become learning examples so the agent can reuse coordinator corrections.
+
+### Worker routes
+
+| Route | Purpose |
+|---|---|
+| `/` | Live care-coordination dashboard |
+| `/trail` | Persistent Decision Trail |
+| `/api/analyze` | Load and score a patient |
+| `/api/rank` | Run Top 5, Top 10, or Top 20 population ranking |
+| `/api/ask` | Ask Groq questions grounded in patient data and D1 RAG memory |
+| `/api/review` | Approve, modify, or reject a recommendation |
+| `/api/setup` | Create or update D1 memory tables |
+| `/api/rag/stats` | Show what the agent has learned |
+
+### Groq keys
+
+Use two Groq keys if available:
+
+```bash
+cd agent
+npx wrangler secret put GROQ_API_KEY       # main key: calibration + coordinator recommendations
+npx wrangler secret put GROQ_API_KEY_ASK   # Ask Agent key: open-ended Q&A
+```
+
+Fallback behavior:
+
+- If `GROQ_API_KEY_ASK` is present, `/api/ask` uses it.
+- If `GROQ_API_KEY_ASK` is missing, `/api/ask` falls back to `GROQ_API_KEY`.
+- Local legacy names `groq` and `groq2` are also supported for development only.
+- Secrets are not committed to git.
+
+### Local development
+
+```bash
+cd agent
+npm install
+npm run typecheck
+npm run dev
+```
+
+Deploy:
+
+```bash
+cd agent
+npm run deploy
+```
+
+---
+
 ## The database
 
 The patient dataset is hosted on a public read-only HTTP API. No account required — just make HTTP requests.

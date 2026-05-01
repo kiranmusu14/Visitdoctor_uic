@@ -17,6 +17,11 @@ dist/
 .dev.vars
 agent/.dev.vars
 
+# Generated presentation binaries
+*.ppt
+*.pptx
+*.key
+
 
 # Internal planning doc
 Complete_Handoff.md
