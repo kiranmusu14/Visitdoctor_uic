@@ -3727,10 +3727,14 @@ function extractPatientNameFromGeneralQuestion(question: string): string {
   }
 
   const normalized = question
+    .replace(/['’]s\b/gi, " ")
     .replace(/[?!.]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
   const patterns = [
+    /\b(?:what\s+(?:are|is)|what'?s|how\s+much\s+(?:is|are)|show|tell|give|list|explain)\s+(.+?)\s+(?:outstanding\s+medical\s+debt|medical\s+debt|outstanding\s+debt|debt|balance|bill|bills|financial)\b/i,
+    /\b(?:outstanding\s+medical\s+debt|medical\s+debt|outstanding\s+debt|debt|balance|bill|bills|financial)\s+(?:for|of|about)\s+(.+?)$/i,
+    /\b(?:outstanding|balance)\s+(?:for|of|about)\s+(.+?)\s+(?:debt|bill|bills)?$/i,
     /\b(?:what\s+(?:are|is)|show|tell|give|list|explain)\s+(.+?)\s+(?:chronic|condition|conditions|management|care\s+plan|risk|barrier|barriers|recommendation|outreach|profile|medication|debt)\b/i,
     /\b(?:chronic|condition|conditions|management|care\s+plan|risk|barrier|barriers|recommendation|outreach|profile|medication|debt)\s+(?:for|of|about)\s+(.+?)$/i,
     /\b(?:for|of|about)\s+(.+?)\s+(?:chronic|condition|conditions|management|care\s+plan|risk|barrier|barriers|recommendation|outreach|profile|medication|debt)\b/i,
@@ -4695,7 +4699,8 @@ function extractPatientNameFromRiskQuestion(question: string): string {
 
 function cleanupPatientNameCandidate(value: string): string {
   return value
-    .replace(/\b(patient|the|is|was|are|at|a|an)\b/gi, " ")
+    .replace(/['’]s\b/gi, " ")
+    .replace(/\b(patient|the|is|was|are|at|a|an|outstanding|medical|debt|balance|bill|bills|financial|of|for|about)\b/gi, " ")
     .replace(/[^a-z0-9'\-\s]/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
