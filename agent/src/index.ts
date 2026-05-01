@@ -180,6 +180,17 @@ interface CoordinatorOutput {
   grounding_check: "GROUNDED";
 }
 
+interface RiskReviewOutput {
+  stance: "Aligned" | "Possibly under-scored" | "Possibly over-scored" | "Needs human review";
+  clinical_take: string;
+  score_commentary: string;
+  supporting_evidence: string[];
+  watchouts: string[];
+  human_review_flag: boolean;
+  confidence: number;
+  grounding_check: "GROUNDED";
+}
+
 interface AskResponse {
   answer: string;
   evidence: string[];
@@ -229,6 +240,7 @@ interface PatientRisk {
   recentEd: EncounterRow[];
   sentinel: SentinelOutput;
   coordinator: CoordinatorOutput;
+  riskReview: RiskReviewOutput;
   calibrationSource: "groq" | "fallback";
   outreachDraft: string;
   draftSource: "groq" | "deterministic";
@@ -1427,13 +1439,16 @@ async function buildPatientRisk(
   };
 
   const sentinel = sentinelScore(patient, profile, calibration);
-  const coordinator = await buildCoordinatorOutput(
-    env,
-    patient,
-    profile,
-    sentinel,
-    calibration,
-  );
+  const [riskReview, coordinator] = await Promise.all([
+    buildRiskReviewOutput(env, patient, profile, sentinel, calibration),
+    buildCoordinatorOutput(
+      env,
+      patient,
+      profile,
+      sentinel,
+      calibration,
+    ),
+  ]);
   const scoreItems = buildScoreItems(sentinel, calibration, profile, patient);
   const score = sentinel.score;
   const riskLevel = sentinel.bucket;
@@ -1461,6 +1476,7 @@ async function buildPatientRisk(
     recentEd: edHistory.slice(0, 5),
     sentinel,
     coordinator,
+    riskReview,
     calibrationSource: calibration.source,
     outreachDraft: formatCoordinatorDraft(patient, coordinator),
     draftSource: coordinator.grounding_check === "GROUNDED" && calibration.source === "groq"
@@ -1752,6 +1768,66 @@ async function buildCoordinatorOutput(
   ], 900, "coordinator");
   const parsed = response ? parseJsonObject(response) : null;
   return normalizeCoordinatorOutput(parsed, patient, profile, sentinel);
+}
+
+async function buildRiskReviewOutput(
+  env: Env,
+  patient: SummaryRow,
+  profile: PatientProfile,
+  sentinel: SentinelOutput,
+  calibration: CalibrationResult,
+): Promise<RiskReviewOutput> {
+  const prompt = `
+You are the Risk Review loop for a healthcare care-coordination demo.
+
+The Sentinel score is LOCKED and deterministic. You must not recalculate it, change it, or output a new score.
+Your job is to give a grounded clinical take on whether the locked score appears consistent with the evidence.
+If something looks mismatched, flag it for human review instead of changing the score.
+
+LOCKED SENTINEL OUTPUT:
+Risk Bucket: ${sentinel.bucket}
+Risk Score: ${sentinel.score}/100
+Priority: ${sentinel.priority}
+Top Driver: ${sentinel.top_driver}
+Tags: ${sentinel.tags.join(", ") || "none"}
+Breakdown: ${JSON.stringify(sentinel.breakdown)}
+
+PATIENT EVIDENCE:
+Name: ${cleanName(patient.first, patient.last)}, Age ${patient.age ?? "unknown"}
+ED Visits: ${patient.ed_visits}
+Inpatient Visits: ${patient.inpatient_visits}
+Active Care Plan: ${patient.has_active_careplan ? "YES" : "NO"}
+Chronic Condition Count: ${patient.chronic_condition_count}
+Chronic Conditions: ${profile.conditions.slice(0, 6).join("; ") || "none on record"}
+Medication Risk: ${profile.medications.length} active medications; opioids ${profile.on_opioids ? "YES" : "NO"}; polypharmacy ${profile.polypharmacy ? "YES" : "NO"}
+SDOH: ${profile.sdoh.join("; ") || "none detected"}
+PRAPARE: ${profile.prapare.join("; ") || "none detected"}
+Outstanding Debt: ${formatCurrency(profile.outstanding_debt)}
+Calibration Insight: ${calibration.medical_reasoning.key_insight}
+
+Return strict JSON only:
+{
+  "stance": "Aligned | Possibly under-scored | Possibly over-scored | Needs human review",
+  "clinical_take": "1-2 sentence clinical interpretation of the locked score",
+  "score_commentary": "1 sentence explicitly saying this is advisory and the Sentinel score remains locked",
+  "supporting_evidence": ["grounded evidence point 1", "grounded evidence point 2", "grounded evidence point 3"],
+  "watchouts": ["thing a human should double-check, or 'None'"],
+  "human_review_flag": false,
+  "confidence": 0.0,
+  "grounding_check": "GROUNDED"
+}
+`;
+
+  const response = await callGroq(env, [
+    {
+      role: "system",
+      content:
+        "Return strict JSON only. Do not rescore. The Sentinel score is locked. Ground every claim in the provided evidence.",
+    },
+    { role: "user", content: prompt },
+  ], 650, "coordinator");
+  const parsed = response ? parseJsonObject(response) : null;
+  return normalizeRiskReviewOutput(parsed, patient, profile, sentinel);
 }
 
 function buildCoordinatorPrompt(
@@ -2080,6 +2156,98 @@ function normalizeCoordinatorOutput(
           .slice(0, 5)
       : fallbackCoordinatorOutput(patient, profile, sentinel).rag_lessons_applied,
     confidence: Math.max(0.5, clampNumber(raw.confidence, 0, 1, 0.78)),
+    grounding_check: "GROUNDED",
+  };
+}
+
+function normalizeRiskReviewOutput(
+  raw: Record<string, unknown> | null,
+  patient: SummaryRow,
+  profile: PatientProfile,
+  sentinel: SentinelOutput,
+): RiskReviewOutput {
+  const fallback = fallbackRiskReviewOutput(patient, profile, sentinel);
+  if (!raw) {
+    return fallback;
+  }
+
+  const stance = readRiskReviewStance(raw.stance, fallback.stance);
+  const evidence = Array.isArray(raw.supporting_evidence)
+    ? raw.supporting_evidence
+        .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+        .slice(0, 4)
+    : fallback.supporting_evidence;
+  const watchouts = Array.isArray(raw.watchouts)
+    ? raw.watchouts
+        .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+        .slice(0, 3)
+    : fallback.watchouts;
+
+  return {
+    stance,
+    clinical_take: readString(raw.clinical_take, fallback.clinical_take),
+    score_commentary: readString(
+      raw.score_commentary,
+      "This is an advisory LLM review; the Sentinel score remains the locked risk score.",
+    ),
+    supporting_evidence: evidence.length ? evidence : fallback.supporting_evidence,
+    watchouts: watchouts.length ? watchouts : fallback.watchouts,
+    human_review_flag: typeof raw.human_review_flag === "boolean"
+      ? raw.human_review_flag
+      : stance !== "Aligned",
+    confidence: Math.max(0.5, clampNumber(raw.confidence, 0, 1, fallback.confidence)),
+    grounding_check: "GROUNDED",
+  };
+}
+
+function readRiskReviewStance(value: unknown, fallback: RiskReviewOutput["stance"]): RiskReviewOutput["stance"] {
+  const text = readString(value, fallback).toLowerCase();
+  if (text.includes("under")) {
+    return "Possibly under-scored";
+  }
+  if (text.includes("over")) {
+    return "Possibly over-scored";
+  }
+  if (text.includes("review")) {
+    return "Needs human review";
+  }
+  return "Aligned";
+}
+
+function fallbackRiskReviewOutput(
+  patient: SummaryRow,
+  profile: PatientProfile,
+  sentinel: SentinelOutput,
+): RiskReviewOutput {
+  const highSignals = [
+    patient.ed_visits >= 10 ? `${patient.ed_visits} ED visits` : "",
+    patient.has_active_careplan ? "" : "no active care plan",
+    patient.chronic_condition_count >= 5 ? `${patient.chronic_condition_count} chronic conditions` : "",
+    profile.outstanding_debt > 10000 ? `${formatCurrency(profile.outstanding_debt)} outstanding debt` : "",
+    profile.polypharmacy ? "polypharmacy" : "",
+    profile.on_opioids ? "active opioid prescription" : "",
+  ].filter(Boolean);
+  const stance: RiskReviewOutput["stance"] =
+    sentinel.bucket === "Low" && highSignals.length >= 3
+      ? "Needs human review"
+      : sentinel.bucket === "High" && highSignals.length === 0
+        ? "Possibly over-scored"
+        : "Aligned";
+
+  return {
+    stance,
+    clinical_take: `${cleanName(patient.first, patient.last)}'s locked Sentinel score of ${sentinel.score}/100 appears ${stance === "Aligned" ? "consistent" : "worth reviewing"} based on ${highSignals.slice(0, 3).join(", ") || "the available patient profile"}.`,
+    score_commentary: "This is an advisory LLM-style review; the Sentinel score remains locked and is not changed.",
+    supporting_evidence: [
+      `Locked Sentinel score: ${sentinel.score}/100 (${sentinel.bucket})`,
+      `Top driver: ${sentinel.top_driver}`,
+      `${patient.ed_visits} ED visits and ${patient.chronic_condition_count} chronic conditions`,
+    ],
+    watchouts: stance === "Aligned"
+      ? ["None beyond normal coordinator review."]
+      : ["Human coordinator should review whether the deterministic inputs are complete."],
+    human_review_flag: stance !== "Aligned",
+    confidence: stance === "Aligned" ? 0.82 : 0.68,
     grounding_check: "GROUNDED",
   };
 }
@@ -3355,6 +3523,7 @@ function summarizeBuiltPatientRiskForAsk(risk: PatientRisk): Record<string, unkn
       reason: encounter.REASONDESCRIPTION || encounter.DESCRIPTION,
       cost: encounter.TOTAL_CLAIM_COST,
     })),
+    risk_score_advisory: risk.riskReview,
     management_plan: summarizeCoordinatorForAsk(risk.coordinator as unknown as Record<string, unknown>),
   };
 }
@@ -3389,6 +3558,7 @@ function summarizePatientRecordForAsk(record: Record<string, unknown>): Record<s
     prapare_signals: parseStringArray(record.prapareSignals).slice(0, 8),
     medication_signals: isRecord(record.medicationSignals) ? record.medicationSignals : {},
     financial_signals: isRecord(record.financialSignals) ? record.financialSignals : {},
+    risk_score_advisory: isRecord(record.riskReview) ? record.riskReview : {},
     management_plan: summarizeCoordinatorForAsk(coordinator),
   };
 }
@@ -3674,6 +3844,7 @@ Keep the answer concise but useful for a 5-minute hackathon demo.
 Do not expose raw technical identifiers or coding fields such as PATIENT, PATIENTID, ENCOUNTER, SYSTEM, CODE, START, STOP, or UUIDs.
 Prefer patient names, risk scores, ED visits, chronic condition counts, care plan status, condition descriptions, social barriers, medications, debt, and recommendation-relevant facts.
 For chronic-condition and management-plan questions, use the patient chronic_conditions and management_plan fields from the RAG packet.
+For questions about whether the score makes sense, use risk_score_advisory. Make clear it is advisory and does not override Sentinel.
 
 Database RAG packet:
 ${compactJson(askRagPacket, 18000)}
@@ -6181,6 +6352,7 @@ function renderApp(): string {
         '</div>' +
         section('Barriers', pills(patient.barriers)) +
         section('Sentinel tags', pills([patient.sentinel.top_driver].concat(patient.sentinel.tags || []))) +
+        section('LLM risk take', riskReviewCard(patient.riskReview)) +
         section('Clinical drivers', pills(patient.clinicalDrivers.slice(0, 6))) +
         section('Score evidence', scoreTable(patient.scoreItems)) +
         section('Recent ED encounters', recentEd(patient.recentEd));
@@ -6249,6 +6421,25 @@ function renderApp(): string {
       }).join('') + '</tbody></table>';
     }
 
+    function riskReviewCard(review) {
+      if (!review) return '<div class="empty">No LLM risk review returned.</div>';
+      var evidence = review.supporting_evidence && review.supporting_evidence.length
+        ? '<ul>' + review.supporting_evidence.map(function (item) {
+            return '<li>' + escapeHtml(item) + '</li>';
+          }).join('') + '</ul>'
+        : '<div class="empty">No evidence listed.</div>';
+      var watchouts = review.watchouts && review.watchouts.length
+        ? '<div class="audit-meta">Watchouts: ' + escapeHtml(review.watchouts.join('; ')) + '</div>'
+        : '';
+      return '<div class="audit-item">' +
+        '<strong>' + escapeHtml(review.stance || 'Advisory review') +
+        (review.human_review_flag ? ' · human review flag' : '') + '</strong>' +
+        '<div class="audit-meta">' + escapeHtml(review.clinical_take || '') + '</div>' +
+        '<div class="audit-meta">' + escapeHtml(review.score_commentary || 'Advisory only; Sentinel score remains locked.') + '</div>' +
+        evidence + watchouts +
+        '</div>';
+    }
+
     function recentEd(items) {
       if (!items || !items.length) return '<div class="empty">No recent ED encounters returned.</div>';
       return '<table class="score-table"><tbody>' + items.map(function (item) {
@@ -6276,6 +6467,7 @@ function renderApp(): string {
         prapareSignals: patient.prapareSignals,
         medicationSignals: patient.medicationSignals,
         financialSignals: patient.financialSignals,
+        riskReview: patient.riskReview,
         coordinator: patient.coordinator
       };
     }
