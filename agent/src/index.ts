@@ -209,6 +209,11 @@ interface AskQueryResult {
   error: string;
 }
 
+interface AskPatientTarget {
+  id: string;
+  name: string;
+}
+
 interface RagContext {
   approved: Array<Record<string, unknown>>;
   rejected: Array<Record<string, unknown>>;
@@ -828,6 +833,15 @@ async function handleAsk(request: Request, env: Env): Promise<AskResponse> {
   );
   if (deterministicRiskCount) {
     return deterministicRiskCount;
+  }
+
+  const directDatabaseAnswer = await answerDirectDatabaseQuestion(
+    env,
+    question,
+    body.selectedPatient,
+  );
+  if (directDatabaseAnswer) {
+    return directDatabaseAnswer;
   }
 
   if (!getGroqApiKey(env, "ask")) {
@@ -3844,6 +3858,7 @@ Keep the answer concise but useful for a 5-minute hackathon demo.
 Do not expose raw technical identifiers or coding fields such as PATIENT, PATIENTID, ENCOUNTER, SYSTEM, CODE, START, STOP, or UUIDs.
 Prefer patient names, risk scores, ED visits, chronic condition counts, care plan status, condition descriptions, social barriers, medications, debt, and recommendation-relevant facts.
 For chronic-condition and management-plan questions, use the patient chronic_conditions and management_plan fields from the RAG packet.
+For debt, outstanding balance, bill, or financial-barrier questions, answer directly from financial_signals.totalOutstanding or financial_signals.total_outstanding.
 For questions about whether the score makes sense, use risk_score_advisory. Make clear it is advisory and does not override Sentinel.
 
 Database RAG packet:
@@ -3966,8 +3981,29 @@ function buildAskRagFallbackAnswer(
     const conditions = parseStringArray(patient.chronic_conditions).slice(0, 6);
     const barriers = parseStringArray(patient.barriers).slice(0, 5);
     const plan = isRecord(patient.management_plan) ? patient.management_plan : {};
+    const financialSignals = isRecord(patient.financial_signals) ? patient.financial_signals : {};
     const action = readString(plan.recommended_action, "");
     const rationale = readString(plan.rationale, "");
+
+    if (normalized.match(/\b(debt|outstanding|balance|bill|bills|financial|cost|owed|owe)\b/)) {
+      const totalOutstanding = normalizeNumber(
+        financialSignals.totalOutstanding ??
+        financialSignals.total_outstanding ??
+        financialSignals.outstanding_debt,
+      );
+      const lowIncome = Boolean(financialSignals.lowIncome ?? financialSignals.low_income);
+      return {
+        answer: totalOutstanding > 0
+          ? `${name}'s outstanding medical debt is ${formatCurrency(totalOutstanding)}. This is treated as a financial barrier in the retrieved profile${lowIncome ? ", alongside a low-income signal" : ""}.`
+          : `${name} does not have a positive outstanding medical debt amount in the retrieved profile.`,
+        evidence: [
+          `Outstanding medical debt: ${formatCurrency(totalOutstanding)}`,
+          `${name}: Sentinel score ${score}/100, ${risk} risk`,
+          `Financial barrier flag: ${totalOutstanding > 10000 ? "high debt" : "not high debt"}`,
+        ],
+        followUp: `Would you like me to explain how debt affected ${name}'s risk score?`,
+      };
+    }
 
     if (normalized.match(/\b(chronic|condition|conditions|management|care plan|plan)\b/)) {
       const conditionText = conditions.length
@@ -4326,6 +4362,219 @@ function readRiskBucket(patient: Record<string, unknown>): string {
   }
   const sentinel = isRecord(patient.sentinel) ? patient.sentinel : null;
   return sentinel ? readString(sentinel.bucket, "") : "";
+}
+
+async function answerDirectDatabaseQuestion(
+  env: Env,
+  question: string,
+  selectedPatientValue: unknown,
+): Promise<AskResponse | null> {
+  const normalized = question.toLowerCase();
+  const intent = normalized.match(/\b(debt|outstanding|balance|bill|bills|owed|owe|financial)\b/)
+    ? "debt"
+    : normalized.match(/\b(chronic|condition|conditions|diagnosis|diagnoses)\b/)
+      ? "conditions"
+      : normalized.match(/\b(medication|medications|meds|opioid|opioids|polypharmacy)\b/)
+        ? "medications"
+        : normalized.match(/\b(care plan|careplan|management plan)\b/)
+          ? "careplan"
+          : normalized.match(/\b(ed visits|emergency visits|visits|inpatient|total visits|cost)\b/)
+            ? "visits"
+            : "";
+
+  if (!intent) {
+    return null;
+  }
+
+  const target = await resolveAskPatientTarget(env, question, selectedPatientValue);
+  if (!target) {
+    return null;
+  }
+
+  try {
+    if (intent === "debt") {
+      const sql = `
+        SELECT ROUND(COALESCE(SUM(OUTSTANDING), 0), 2) AS total_outstanding
+        FROM claims_transactions
+        WHERE PATIENTID = '${escapeSql(target.id)}'
+        LIMIT 1
+      `;
+      const rows = await queryDatabase<Record<string, unknown>>(env, sql);
+      const total = rowNumber(rows[0] || {}, "total_outstanding", "TOTAL_OUTSTANDING");
+      return {
+        answer: `${target.name}'s outstanding medical debt is ${formatCurrency(total)}.`,
+        evidence: [
+          `claims_transactions outstanding balance: ${formatCurrency(total)}`,
+          "Live database aggregate used: SUM(OUTSTANDING)",
+          "Join key used: PATIENTID",
+        ],
+        queries: [
+          {
+            label: "claims_transactions outstanding debt",
+            sql: "SELECT SUM(OUTSTANDING) FROM claims_transactions WHERE PATIENTID = <selected patient>",
+            rowCount: rows.length,
+          },
+        ],
+        followUp: `Would you like me to explain how financial barriers affect ${target.name}'s risk score?`,
+      };
+    }
+
+    if (intent === "conditions") {
+      const sql = `
+        SELECT DESCRIPTION
+        FROM conditions
+        WHERE PATIENT = '${escapeSql(target.id)}' AND STOP IS NULL
+        ORDER BY START DESC
+        LIMIT 12
+      `;
+      const rows = await queryDatabase<Record<string, unknown>>(env, sql);
+      const conditions = rows
+        .map((row) => rowString(row, "DESCRIPTION", "description"))
+        .filter(Boolean);
+      return {
+        answer: conditions.length
+          ? `${target.name}'s active conditions in the live database include: ${conditions.join(", ")}.`
+          : `${target.name} has no active conditions returned by the live conditions table.`,
+        evidence: [`Active conditions returned: ${conditions.length}`],
+        queries: [{
+          label: "active conditions",
+          sql: "SELECT DESCRIPTION FROM conditions WHERE PATIENT = <selected patient> AND STOP IS NULL",
+          rowCount: rows.length,
+        }],
+        followUp: `Would you like the care plan recommendation for ${target.name}?`,
+      };
+    }
+
+    if (intent === "medications") {
+      const sql = `
+        SELECT DESCRIPTION
+        FROM medications
+        WHERE PATIENT = '${escapeSql(target.id)}' AND STOP IS NULL
+        ORDER BY START DESC
+        LIMIT 12
+      `;
+      const rows = await queryDatabase<Record<string, unknown>>(env, sql);
+      const medications = rows
+        .map((row) => rowString(row, "DESCRIPTION", "description"))
+        .filter(Boolean);
+      return {
+        answer: medications.length
+          ? `${target.name}'s active medications in the live database include: ${medications.join(", ")}.`
+          : `${target.name} has no active medications returned by the live medications table.`,
+        evidence: [`Active medications returned: ${medications.length}`],
+        queries: [{
+          label: "active medications",
+          sql: "SELECT DESCRIPTION FROM medications WHERE PATIENT = <selected patient> AND STOP IS NULL",
+          rowCount: rows.length,
+        }],
+        followUp: `Would you like me to check medication risk for ${target.name}?`,
+      };
+    }
+
+    if (intent === "careplan") {
+      const sql = `
+        SELECT DESCRIPTION, START, STOP
+        FROM careplans
+        WHERE PATIENT = '${escapeSql(target.id)}'
+        ORDER BY START DESC
+        LIMIT 8
+      `;
+      const rows = await queryDatabase<Record<string, unknown>>(env, sql);
+      const active = rows.filter((row) => !rowString(row, "STOP", "stop"));
+      const latest = rows
+        .map((row) => rowString(row, "DESCRIPTION", "description"))
+        .filter(Boolean)
+        .slice(0, 3);
+      return {
+        answer: active.length
+          ? `${target.name} has ${active.length} active care plan(s) in the live database. Latest plan descriptions: ${latest.join(", ") || "not described"}.`
+          : `${target.name} has no active care plan in the live careplans table.`,
+        evidence: [
+          `Care plans returned: ${rows.length}`,
+          `Active care plans: ${active.length}`,
+        ],
+        queries: [{
+          label: "careplans",
+          sql: "SELECT DESCRIPTION, START, STOP FROM careplans WHERE PATIENT = <selected patient>",
+          rowCount: rows.length,
+        }],
+        followUp: `Would you like the Coordinator recommendation for ${target.name}?`,
+      };
+    }
+
+    if (intent === "visits") {
+      const sql = `
+        SELECT ed_visits, inpatient_visits, total_visits, ed_inpatient_total_cost,
+               chronic_condition_count, has_active_careplan
+        FROM patient_summary
+        WHERE id = '${escapeSql(target.id)}'
+        LIMIT 1
+      `;
+      const rows = await queryDatabase<Record<string, unknown>>(env, sql);
+      const row = rows[0] || {};
+      return {
+        answer: `${target.name} has ${rowNumber(row, "ed_visits")} ED visits, ${rowNumber(row, "inpatient_visits")} inpatient visits, and ${rowNumber(row, "total_visits")} total visits in patient_summary. ED/inpatient total cost is ${formatCurrency(rowNumber(row, "ed_inpatient_total_cost"))}.`,
+        evidence: [
+          `ED visits: ${rowNumber(row, "ed_visits")}`,
+          `Inpatient visits: ${rowNumber(row, "inpatient_visits")}`,
+          `ED/inpatient total cost: ${formatCurrency(rowNumber(row, "ed_inpatient_total_cost"))}`,
+        ],
+        queries: [{
+          label: "patient_summary visit facts",
+          sql: "SELECT visit and cost fields FROM patient_summary WHERE id = <selected patient>",
+          rowCount: rows.length,
+        }],
+        followUp: `Would you like me to explain ${target.name}'s Sentinel score drivers?`,
+      };
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
+async function resolveAskPatientTarget(
+  env: Env,
+  question: string,
+  selectedPatientValue: unknown,
+): Promise<AskPatientTarget | null> {
+  const selected = readSelectedAskPatientTarget(selectedPatientValue);
+  const requestedName = extractPatientNameFromGeneralQuestion(question);
+  if (requestedName && (!selected || !namesRoughlyMatch(requestedName, selected.name))) {
+    const candidates = await findPatientsByName(env, requestedName, 1);
+    const patient = candidates[0];
+    return patient
+      ? { id: patient.id, name: cleanName(patient.first, patient.last) }
+      : selected;
+  }
+  if (selected) {
+    return selected;
+  }
+  if (requestedName) {
+    const candidates = await findPatientsByName(env, requestedName, 1);
+    const patient = candidates[0];
+    return patient
+      ? { id: patient.id, name: cleanName(patient.first, patient.last) }
+      : null;
+  }
+  return null;
+}
+
+function readSelectedAskPatientTarget(value: unknown): AskPatientTarget | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const patient = isRecord(value.patient) ? value.patient : {};
+  const id = readString(patient.id, readString(value.id, ""));
+  if (!id) {
+    return null;
+  }
+  const name = readString(
+    value.displayName,
+    cleanName(readString(patient.first, ""), readString(patient.last, "")),
+  );
+  return { id, name: name || "selected patient" };
 }
 
 async function answerNamedPatientRiskQuestion(
