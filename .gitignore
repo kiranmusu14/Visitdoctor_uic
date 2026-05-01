@@ -13,6 +13,9 @@ __pycache__/
 # Node
 node_modules/
 dist/
+.wrangler/
+.dev.vars
+agent/.dev.vars
 
 
 # Internal planning doc

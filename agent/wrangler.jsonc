@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "silent-snow-e388",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-01",
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "DATA_API_URL": "https://uic-hackathon-data.christian-7f4.workers.dev/query",
+    "GROQ_MODEL": "llama-3.3-70b-versatile"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "agent-memory",
+      "database_id": "ea019e1e-2c5d-45f3-b215-875314a1e198"
+    }
+  ]
+}
